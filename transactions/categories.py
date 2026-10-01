@@ -1,0 +1,91 @@
+CATEGORIES = {
+    "Food & Dining": [
+        "Restaurants",
+        "Cafes",
+        "Fast Food",
+        "Food Delivery",
+    ],
+    "Groceries": [
+        "Supermarkets",
+        "Grocery Stores",
+        "Online Grocery",
+    ],
+    "Transportation": [
+        "Fuel",
+        "Taxi",
+        "Ride Sharing",
+        "Public Transport",
+        "Parking",
+        "Tolls",
+        "Vehicle Maintenance",
+    ],
+    "Housing": [
+        "Rent",
+        "Mortgage",
+        "Home Maintenance",
+    ],
+    "Bills & Utilities": [
+        "Electricity",
+        "Water",
+        "Internet",
+        "Mobile",
+        "Telecom",
+        "Subscriptions",
+    ],
+    "Healthcare": [
+        "Hospital",
+        "Doctor",
+        "Pharmacy",
+        "Insurance",
+    ],
+    "Shopping": [
+        "Clothing",
+        "Electronics",
+        "Home",
+        "General Shopping",
+    ],
+    "Entertainment": [
+        "Movies",
+        "Gaming",
+        "Events",
+        "Streaming",
+    ],
+    "Travel": [
+        "Flights",
+        "Hotels",
+        "Travel",
+        "Visa",
+    ],
+    "Education": [
+        "Courses",
+        "Books",
+        "Tuition",
+    ],
+    "Financial": [
+        "Bank Fees",
+        "Card Fees",
+        "Interest",
+        "ATM Fees",
+    ],
+    "Income": [
+        "Salary",
+        "Freelance",
+        "Business Income",
+        "Interest Income",
+        "Other Income",
+    ],
+    "Transfers": [
+        "Bank Transfer",
+        "Card Payment",
+        "Internal Transfer",
+    ],
+    "Taxes": [
+        "Income Tax",
+        "Sales Tax",
+        "Government Fees",
+    ],
+    "Other": [
+        "Uncategorized",
+        "Unknown",
+    ],
+}
