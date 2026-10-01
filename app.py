@@ -1,13 +1,13 @@
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import time
 from collections import Counter
 from decimal import Decimal
 from html import escape
+from io import BytesIO
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -15,13 +15,17 @@ import requests
 import streamlit as st
 from dotenv import load_dotenv
 
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_RIGHT
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.platypus import BaseDocTemplate, Frame, PageTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+
 from ingestion.pipeline import FinancialStatementPipeline
 from transactions.models import Transaction, TransactionDirection
-try:
-    from pypdf import PdfReader
-except Exception:
-    PdfReader = None
 from ai.rag_service import StatementRAG
+from learning.category_memory import HybridCategoryEngine, CategoryMemory, merchant_key
 
 load_dotenv()
 
@@ -39,20 +43,122 @@ st.set_page_config(
 defaults = {
     "page": "Home",
     "transactions": [],
-    "transactions_backup": [],
     "file_name": None,
     "chat_history": [],
     "ai_summary": None,
     "transaction_focus": None,
+    "category_engine": None,
+    "transactions_backup": [],
+    "category_review_skipped": False,
+    "upload_mode": False,
 }
 
 for key, value in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
+
+def _transaction_backup_path():
+    os.makedirs("storage", exist_ok=True)
+    return os.path.join("storage", "finora_last_transactions.json")
+
+
+def _save_transaction_backup(transactions):
+    """Persist the latest successful extraction so a Streamlit reconnect cannot empty the dashboard."""
+    payload = [
+        transaction.model_dump(mode="json")
+        for transaction in (transactions or [])
+    ]
+    st.session_state.transactions_backup = payload
+    try:
+        with open(_transaction_backup_path(), "w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+    except Exception:
+        # The live session remains usable even if local persistence fails.
+        pass
+
+
+def _restore_transaction_backup():
+    """Restore transactions from session/disk after a browser or Streamlit reconnect."""
+    if st.session_state.get("transactions"):
+        return st.session_state.transactions
+
+    payload = st.session_state.get("transactions_backup") or []
+
+    if not payload:
+        try:
+            backup_path = _transaction_backup_path()
+            if os.path.exists(backup_path):
+                with open(backup_path, "r", encoding="utf-8") as file:
+                    payload = json.load(file)
+        except Exception:
+            payload = []
+
+    if not payload:
+        return []
+
+    restored = []
+    for item in payload:
+        try:
+            restored.append(Transaction.model_validate(item))
+        except Exception:
+            continue
+
+    if restored:
+        st.session_state.transactions = restored
+        st.session_state.transactions_backup = payload
+
+    return restored
+
+
+# Recover the latest successful analysis before routing the page.
+# This is important because the browser can reconnect after a long PDF
+# analysis and Streamlit may create a fresh session.
+if not st.session_state.get("upload_mode", False):
+    _restore_transaction_backup()
+
 requested_page = st.query_params.get("page")
-if requested_page in {"Overview", "Transactions", "AI"}:
+new_statement_request = st.query_params.get("new") == "1"
+
+# Clicking the Finora AI brand always returns to the main upload/home screen.
+# The explicit `new=1` flag also prevents the previous statement backup from
+# being restored immediately after navigation.
+if new_statement_request:
+    st.session_state.transactions = []
+    st.session_state.transactions_backup = []
+    st.session_state.file_name = None
+    st.session_state.chat_history = []
+    st.session_state.ai_summary = None
+    st.session_state.category_engine = None
+    st.session_state.transaction_focus = None
+    st.session_state.category_review_skipped = False
+    st.session_state.upload_mode = True
+    st.session_state.page = "Home"
+    requested_page = "Home"
+    st.query_params.clear()
+    st.query_params["page"] = "Home"
+
+# Normalize page state after code upgrades. Streamlit keeps session_state
+# across hot-reloads, so an older Finora version can leave values such as
+# Dashboard / Analytics / Upload Statement behind. If the value is not one
+# of the routes used by this version, recover to a real route instead of
+# rendering only the navigation bar.
+VALID_PAGES = {"Home", "Overview", "Transactions", "AI", "Review", "Upload"}
+
+current_page = st.session_state.get("page")
+has_transactions = bool(st.session_state.get("transactions"))
+
+if requested_page == "Upload":
+    st.session_state.page = "Home"
+elif requested_page in {"Overview", "Transactions", "AI", "Review"}:
     st.session_state.page = requested_page
+elif current_page in {"Home", "Upload"} and has_transactions and not st.session_state.get("upload_mode", False):
+    # A Streamlit reconnect can restore transactions from disk while the
+    # session page is still the initial Home/Upload value. Never leave the
+    # application between routes in that state; show the analyzed data.
+    st.session_state.page = "Overview"
+elif current_page not in VALID_PAGES:
+    st.session_state.page = "Overview" if has_transactions else "Home"
 
 
 # ============================================================
@@ -88,6 +194,26 @@ header { background:transparent !important; }
     display:flex;
     align-items:center;
     gap:11px;
+}
+
+.finora-brand-link {
+    display:block;
+    color:inherit !important;
+    text-decoration:none !important;
+    cursor:pointer;
+}
+
+.finora-brand-link:hover .brand-name {
+    color:#ffffff;
+}
+
+.finora-brand-link:hover .logo {
+    transform:translateY(-1px);
+    box-shadow:0 14px 38px rgba(99,102,241,.36);
+}
+
+.finora-brand-link .logo {
+    transition:transform .18s ease, box-shadow .18s ease;
 }
 
 .logo {
@@ -1593,10 +1719,97 @@ button[kind="primary"] {
 }
 
 .rank-card {
-    padding:21px 22px 15px;
-    border:1px solid #1c293b;
-    border-radius:21px;
-    background:linear-gradient(145deg,#0f1725,#0a111c);
+    padding:16px 18px 10px;
+    border:1px solid rgba(71,85,105,.34);
+    border-radius:24px;
+    background:
+        radial-gradient(circle at 10% 0%, rgba(99,102,241,.09), transparent 34%),
+        linear-gradient(145deg,#101827,#09101b);
+    box-shadow:0 18px 45px rgba(0,0,0,.18);
+}
+
+.rank-row {
+    padding:14px 8px 15px;
+    border-bottom:1px solid rgba(51,65,85,.28);
+    border-radius:14px;
+    transition:background .18s ease, transform .18s ease;
+}
+
+.rank-row:hover {
+    background:rgba(99,102,241,.055);
+    transform:translateX(2px);
+}
+
+.rank-row:last-child {
+    border-bottom:0;
+}
+
+.rank-top {
+    display:flex;
+    align-items:center;
+    gap:10px;
+}
+
+.rank-number {
+    width:24px;
+    color:#475569;
+    font-size:.52rem;
+    font-weight:900;
+    letter-spacing:.4px;
+}
+
+.rank-icon {
+    width:31px;
+    height:31px;
+    flex:0 0 31px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    border:1px solid rgba(129,140,248,.16);
+    border-radius:10px;
+    background:rgba(99,102,241,.08);
+    font-size:.86rem;
+}
+
+.rank-name {
+    flex:1;
+    min-width:0;
+    overflow:hidden;
+    color:#eaf0f8;
+    font-size:.70rem;
+    font-weight:850;
+    white-space:nowrap;
+    text-overflow:ellipsis;
+}
+
+.rank-amount {
+    color:#f8fafc;
+    font-size:.69rem;
+    font-weight:900;
+    white-space:nowrap;
+}
+
+.rank-track {
+    height:6px;
+    margin:9px 0 0 65px;
+    overflow:hidden;
+    border-radius:999px;
+    background:#182337;
+}
+
+.rank-track span {
+    display:block;
+    height:100%;
+    border-radius:999px;
+    background:linear-gradient(90deg,#6366f1,#60a5fa);
+    box-shadow:0 0 12px rgba(96,165,250,.18);
+}
+
+.rank-sub {
+    margin:5px 0 0 65px;
+    color:#64748b;
+    font-size:.54rem;
+    font-weight:650;
 }
 
 .rank-row {
@@ -1658,6 +1871,93 @@ button[kind="primary"] {
     margin:4px 0 0 29px;
     color:#475569;
     font-size:.51rem;
+}
+
+
+.section-icon {
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    width:30px;
+    height:30px;
+    margin-right:9px;
+    border:1px solid rgba(129,140,248,.18);
+    border-radius:10px;
+    background:rgba(99,102,241,.08);
+    vertical-align:middle;
+    font-size:.82rem;
+}
+
+.intel-title-line {
+    display:flex;
+    align-items:center;
+}
+
+
+.pdf-report-card {
+    display:flex; align-items:center; gap:14px; margin:8px 0 10px; padding:17px 19px;
+    border:1px solid rgba(99,102,241,.22); border-radius:22px;
+    background:radial-gradient(circle at 0% 50%,rgba(99,102,241,.13),transparent 34%),linear-gradient(135deg,rgba(15,23,42,.96),rgba(10,15,28,.96));
+    box-shadow:0 18px 42px rgba(0,0,0,.16);
+}
+.pdf-report-copy {display:flex; align-items:center; gap:12px;}
+.pdf-report-icon {width:43px;height:43px;display:flex;align-items:center;justify-content:center;border-radius:13px;background:linear-gradient(135deg,#6366f1,#4f46e5);color:#fff;font-size:.63rem;font-weight:950;letter-spacing:.4px;box-shadow:0 10px 24px rgba(79,70,229,.25);}
+.pdf-report-title {color:#f8fafc;font-size:.77rem;font-weight:900;}
+.pdf-report-sub {max-width:850px;margin-top:4px;color:#64748b;font-size:.56rem;line-height:1.55;}
+[data-testid="stDownloadButton"] button {min-height:46px;border:1px solid rgba(129,140,248,.28)!important;border-radius:14px!important;background:linear-gradient(135deg,#5b55e8,#4f46e5)!important;color:#fff!important;font-weight:850!important;box-shadow:0 12px 30px rgba(79,70,229,.18)!important;}
+[data-testid="stDownloadButton"] button:hover {border-color:rgba(165,180,252,.55)!important;transform:translateY(-1px);}
+
+.category-summary-strip {
+    display:grid;
+    grid-template-columns:repeat(4,1fr);
+    gap:10px;
+    margin:12px 0 16px;
+}
+
+.category-mini {
+    padding:13px 14px;
+    border:1px solid rgba(71,85,105,.28);
+    border-radius:17px;
+    background:rgba(15,23,37,.58);
+}
+
+.category-mini-top {
+    display:flex;
+    align-items:center;
+    gap:8px;
+    color:#cbd5e1;
+    font-size:.57rem;
+    font-weight:800;
+}
+
+.category-mini-icon {
+    width:25px;
+    height:25px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    border-radius:8px;
+    background:rgba(99,102,241,.09);
+    font-size:.72rem;
+}
+
+.category-mini-value {
+    margin-top:7px;
+    color:#f8fafc;
+    font-size:.78rem;
+    font-weight:900;
+}
+
+.category-mini-share {
+    margin-top:3px;
+    color:#64748b;
+    font-size:.51rem;
+}
+
+@media (max-width: 900px) {
+    .category-summary-strip {
+        grid-template-columns:repeat(2,1fr);
+    }
 }
 
 .flow-card {
@@ -2349,6 +2649,156 @@ div.st-key-finora_ai_popover .stButton > button { min-height:46px !important; fo
   div.st-key-finora_ai_popover > div, div.st-key-finora_ai_popover [data-testid="stPopoverBody"] { width:calc(100vw - 28px) !important; max-width:calc(100vw - 28px) !important; }
 }
 @media (max-width:900px) { .block-container{padding:18px 18px 70px !important;} .finora-nav{justify-content:flex-start;overflow-x:auto;} .finora-nav-link{min-height:48px;padding:0 17px;font-size:.92rem;} }
+
+/* ============================================================
+   FINORA V2 — CATEGORY REVIEW POPUP / REVIEW WORKSPACE
+   ============================================================ */
+.category-review-shell {
+    position:relative;
+    margin:8px auto 0;
+    max-width:1180px;
+    padding:28px;
+    border:1px solid #293858;
+    border-radius:28px;
+    background:
+        radial-gradient(circle at 90% 0%,rgba(99,102,241,.18),transparent 30%),
+        radial-gradient(circle at 0% 100%,rgba(14,165,233,.07),transparent 28%),
+        linear-gradient(145deg,#101827,#090f19);
+    box-shadow:0 28px 90px rgba(0,0,0,.34);
+}
+.category-review-kicker {
+    color:#818cf8;
+    font-size:.68rem;
+    font-weight:900;
+    letter-spacing:1.7px;
+}
+.category-review-title {
+    margin-top:7px;
+    color:#f8fafc;
+    font-size:2rem;
+    line-height:1.1;
+    font-weight:900;
+    letter-spacing:-.8px;
+}
+.category-review-subtitle {
+    max-width:780px;
+    margin-top:8px;
+    color:#94a3b8;
+    font-size:.9rem;
+    line-height:1.6;
+}
+.category-review-summary {
+    display:grid;
+    grid-template-columns:1fr 1fr 1fr;
+    gap:12px;
+    margin-top:22px;
+}
+.category-review-stat {
+    padding:16px 18px;
+    border:1px solid #1d2a3f;
+    border-radius:17px;
+    background:rgba(7,13,23,.48);
+}
+.category-review-stat-label {
+    color:#64748b;
+    font-size:.64rem;
+    font-weight:850;
+    letter-spacing:.8px;
+    text-transform:uppercase;
+}
+.category-review-stat-value {
+    margin-top:6px;
+    color:#f8fafc;
+    font-size:1.35rem;
+    font-weight:900;
+}
+.category-review-stat-sub {
+    margin-top:3px;
+    color:#526176;
+    font-size:.65rem;
+}
+.category-review-progress {
+    height:7px;
+    margin-top:18px;
+    overflow:hidden;
+    border-radius:999px;
+    background:#172238;
+}
+.category-review-progress span {
+    display:block;
+    height:100%;
+    border-radius:999px;
+    background:linear-gradient(90deg,#4f46e5,#818cf8,#60a5fa);
+}
+.category-review-progress-label {
+    display:flex;
+    justify-content:space-between;
+    gap:12px;
+    margin-top:6px;
+    color:#64748b;
+    font-size:.62rem;
+}
+.category-review-card {
+    margin:0 0 12px;
+    padding:19px;
+    border:1px solid #1d2a3f;
+    border-radius:19px;
+    background:linear-gradient(145deg,#0f1725,#0b121e);
+}
+.category-review-merchant {
+    color:#f8fafc;
+    font-size:1rem;
+    font-weight:850;
+}
+.category-review-description {
+    margin-top:5px;
+    color:#64748b;
+    font-size:.73rem;
+    line-height:1.5;
+}
+.category-review-amount {
+    color:#c7d2fe;
+    font-size:1.02rem;
+    font-weight:900;
+    white-space:nowrap;
+}
+.category-review-suggestion {
+    display:inline-flex;
+    margin-top:10px;
+    padding:5px 9px;
+    border-radius:999px;
+    color:#a5b4fc;
+    background:rgba(99,102,241,.09);
+    border:1px solid rgba(129,140,248,.18);
+    font-size:.62rem;
+    font-weight:800;
+}
+.category-review-footer {
+    position:sticky;
+    bottom:0;
+    z-index:10;
+    margin-top:15px;
+    padding:15px 17px;
+    border:1px solid #293858;
+    border-radius:17px;
+    background:rgba(10,16,28,.94);
+    backdrop-filter:blur(16px);
+}
+.category-review-footer-text {
+    color:#94a3b8;
+    font-size:.72rem;
+    line-height:1.5;
+}
+.category-review-footer-text strong {
+    color:#fff;
+}
+@media(max-width:900px) {
+    .category-review-shell { padding:20px 15px; border-radius:21px; }
+    .category-review-title { font-size:1.55rem; }
+    .category-review-summary { grid-template-columns:1fr; }
+    .category-review-amount { margin-top:8px; }
+}
+
 </style>
 """)
 
@@ -2422,6 +2872,164 @@ def make_dataframe(transactions):
 
     rows = [transaction_dict(t) for t in transactions]
     return pd.DataFrame(rows, columns=columns)
+
+
+
+def build_finora_pdf_report(transactions, file_name=None, ai_summary=None):
+    """Create a polished PDF containing the overview and complete transaction ledger."""
+    txns = list(transactions or [])
+    currency = get_currency(txns)
+    income, expenses, net = calculate_financials(txns)
+    df = make_dataframe(txns)
+    category_df = get_categories(txns)
+
+    if not category_df.empty:
+        category_df = category_df.copy()
+        category_df["Share"] = category_df["Amount"].apply(
+            lambda value: (float(value) / float(expenses) * 100.0) if float(expenses) else 0.0
+        )
+
+    debit_df = df[df["Direction"].astype(str).str.lower() == "debit"].copy() if not df.empty else pd.DataFrame()
+    if not debit_df.empty:
+        merchant_df = (
+            debit_df.assign(Merchant=debit_df["Merchant"].replace("", "Unknown merchant"))
+            .groupby("Merchant", as_index=False)["Amount"]
+            .sum()
+            .sort_values("Amount", ascending=False)
+        )
+    else:
+        merchant_df = pd.DataFrame(columns=["Merchant", "Amount"])
+
+    review_count = sum(bool(getattr(t, "requires_review", False)) for t in txns)
+    categorized_count = sum(
+        bool(getattr(t, "category", None))
+        and str(getattr(t, "category", "")).strip().casefold() not in {"uncategorized", "unknown"}
+        for t in txns
+    )
+
+    page_size = landscape(A4)
+    buffer = BytesIO()
+
+    class FinoraDocTemplate(BaseDocTemplate):
+        pass
+
+    doc = FinoraDocTemplate(
+        buffer, pagesize=page_size,
+        rightMargin=12 * mm, leftMargin=12 * mm,
+        topMargin=18 * mm, bottomMargin=14 * mm,
+        title="Finora AI Financial Statement Report",
+        author="Finora AI",
+    )
+    frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="normal")
+
+    def draw_page(canvas, doc_obj):
+        canvas.saveState()
+        width, height = page_size
+        canvas.setStrokeColor(colors.HexColor("#E2E8F0"))
+        canvas.setLineWidth(.5)
+        canvas.line(12 * mm, height - 10 * mm, width - 12 * mm, height - 10 * mm)
+        canvas.setFillColor(colors.HexColor("#4F46E5"))
+        canvas.roundRect(12 * mm, height - 8.8 * mm, 8 * mm, 6 * mm, 1.5 * mm, fill=1, stroke=0)
+        canvas.setFillColor(colors.white)
+        canvas.setFont("Helvetica-Bold", 8)
+        canvas.drawCentredString(16 * mm, height - 6.9 * mm, "F")
+        canvas.setFillColor(colors.HexColor("#111827"))
+        canvas.setFont("Helvetica-Bold", 9)
+        canvas.drawString(23 * mm, height - 6.7 * mm, "Finora AI")
+        canvas.setFillColor(colors.HexColor("#64748B"))
+        canvas.setFont("Helvetica", 7)
+        canvas.drawRightString(width - 12 * mm, height - 6.7 * mm, "Financial Intelligence Report")
+        canvas.setStrokeColor(colors.HexColor("#E2E8F0"))
+        canvas.line(12 * mm, 8 * mm, width - 12 * mm, 8 * mm)
+        canvas.setFillColor(colors.HexColor("#94A3B8"))
+        canvas.setFont("Helvetica", 6.5)
+        canvas.drawString(12 * mm, 4.8 * mm, "FINORA AI · Turn financial statements into financial intelligence.")
+        canvas.drawRightString(width - 12 * mm, 4.8 * mm, f"Page {doc_obj.page}")
+        canvas.restoreState()
+
+    doc.addPageTemplates([PageTemplate(id="finora", frames=frame, onPage=draw_page)])
+    styles = getSampleStyleSheet()
+    title = ParagraphStyle("FinoraTitle", parent=styles["Title"], fontName="Helvetica-Bold", fontSize=24, leading=28, textColor=colors.HexColor("#0F172A"), spaceAfter=4)
+    subtitle = ParagraphStyle("FinoraSubtitle", parent=styles["Normal"], fontSize=9, leading=13, textColor=colors.HexColor("#64748B"), spaceAfter=12)
+    h1 = ParagraphStyle("FinoraH1", parent=styles["Heading1"], fontName="Helvetica-Bold", fontSize=14, leading=17, textColor=colors.HexColor("#111827"), spaceBefore=3, spaceAfter=7)
+    body = ParagraphStyle("FinoraBody", parent=styles["BodyText"], fontSize=8, leading=11, textColor=colors.HexColor("#475569"))
+    small = ParagraphStyle("FinoraSmall", parent=body, fontSize=7, leading=9, textColor=colors.HexColor("#64748B"))
+    th = ParagraphStyle("FinoraTH", parent=body, fontName="Helvetica-Bold", fontSize=6.8, leading=8.5, textColor=colors.white)
+    tc = ParagraphStyle("FinoraTC", parent=body, fontSize=6.5, leading=8, textColor=colors.HexColor("#1E293B"))
+    tr = ParagraphStyle("FinoraTR", parent=tc, alignment=TA_RIGHT)
+
+    story = [Spacer(1, 2 * mm), Paragraph("Financial statement report", title)]
+    report_name = str(file_name or "Financial Statement")
+    story.append(Paragraph(f"<b>{escape(report_name)}</b> · {escape(currency)} · {len(txns):,} transactions", subtitle))
+
+    cards = Table([
+        [Paragraph("RECEIVED", small), Paragraph("SPENT", small), Paragraph("NET POSITION", small), Paragraph("ACTIVITY", small), Paragraph("NEEDS REVIEW", small)],
+        [Paragraph(f"<b>{money(income, currency)}</b>", ParagraphStyle("c1", parent=h1, fontSize=11, textColor=colors.HexColor("#047857"))), Paragraph(f"<b>{money(expenses, currency)}</b>", ParagraphStyle("c2", parent=h1, fontSize=11, textColor=colors.HexColor("#B91C1C"))), Paragraph(f"<b>{money(net, currency)}</b>", ParagraphStyle("c3", parent=h1, fontSize=11, textColor=colors.HexColor("#4338CA"))), Paragraph(f"<b>{len(txns):,}</b>", ParagraphStyle("c4", parent=h1, fontSize=11)), Paragraph(f"<b>{review_count:,}</b>", ParagraphStyle("c5", parent=h1, fontSize=11, textColor=colors.HexColor("#B45309")))],
+    ], colWidths=[doc.width / 5] * 5)
+    cards.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), colors.HexColor("#F8FAFC")), ("BOX", (0,0), (-1,-1), .5, colors.HexColor("#E2E8F0")),
+        ("INNERGRID", (0,0), (-1,-1), .3, colors.HexColor("#E2E8F0")), ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("LEFTPADDING", (0,0), (-1,-1), 8), ("RIGHTPADDING", (0,0), (-1,-1), 8), ("TOPPADDING", (0,0), (-1,-1), 6), ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+    ]))
+    story += [cards, Spacer(1, 7 * mm), Paragraph("Spending by category", h1)]
+
+    if category_df.empty:
+        story.append(Paragraph("No outgoing category data was available.", body))
+    else:
+        rows = [[Paragraph("CATEGORY", th), Paragraph("SPENDING", th), Paragraph("SHARE", th)]]
+        for _, row in category_df.iterrows():
+            rows.append([Paragraph(escape(str(row["Category"])), tc), Paragraph(money(row["Amount"], currency), tr), Paragraph(f"{float(row['Share']):.1f}%", tr)])
+        rows.append([Paragraph("<b>Total spending</b>", tc), Paragraph(f"<b>{money(expenses, currency)}</b>", tr), Paragraph("100.0%", tr)])
+        table = Table(rows, colWidths=[doc.width*.55, doc.width*.27, doc.width*.18], repeatRows=1)
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#4F46E5")), ("GRID", (0,0), (-1,-1), .3, colors.HexColor("#E2E8F0")),
+            ("ROWBACKGROUNDS", (0,1), (-1,-2), [colors.white, colors.HexColor("#F8FAFC")]), ("BACKGROUND", (0,-1), (-1,-1), colors.HexColor("#EEF2FF")),
+            ("LEFTPADDING", (0,0), (-1,-1), 7), ("RIGHTPADDING", (0,0), (-1,-1), 7), ("TOPPADDING", (0,0), (-1,-1), 5), ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+        ]))
+        story.append(table)
+
+    story += [Spacer(1, 7 * mm), Paragraph("Top outgoing merchants", h1)]
+    if merchant_df.empty:
+        story.append(Paragraph("No outgoing merchant data was available.", body))
+    else:
+        rows = [[Paragraph("MERCHANT", th), Paragraph("SPENDING", th)]]
+        for _, row in merchant_df.head(12).iterrows():
+            rows.append([Paragraph(escape(str(row["Merchant"])), tc), Paragraph(money(row["Amount"], currency), tr)])
+        table = Table(rows, colWidths=[doc.width*.72, doc.width*.28], repeatRows=1)
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#0F172A")), ("GRID", (0,0), (-1,-1), .3, colors.HexColor("#E2E8F0")),
+            ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#F8FAFC")]),
+            ("LEFTPADDING", (0,0), (-1,-1), 7), ("RIGHTPADDING", (0,0), (-1,-1), 7), ("TOPPADDING", (0,0), (-1,-1), 4), ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+        ]))
+        story.append(table)
+
+    story += [Spacer(1, 7 * mm), Paragraph("Finora intelligence", h1)]
+    summary = str(ai_summary or "").strip()
+    if not summary:
+        summary = f"{categorized_count:,} of {len(txns):,} transactions currently have a meaningful category. {review_count:,} transaction(s) are flagged for review. The report uses the current finalized transaction data for all totals."
+    story.append(Paragraph(escape(summary).replace("\n", "<br/>"), body))
+
+    story += [PageBreak(), Paragraph("Complete transaction ledger", title), Paragraph("Every extracted transaction is included below. Categories and review status reflect the current Finora transaction data.", subtitle)]
+    headers = ["Date","Merchant","Description","Amount","Currency","Direction","Type","Category","Confidence","Review"]
+    rows = [[Paragraph(escape(h.upper()), th) for h in headers]]
+    for _, row in df.iterrows():
+        rows.append([
+            Paragraph(escape(str(row.get("Date", ""))), tc), Paragraph(escape(str(row.get("Merchant", "") or "Unknown")), tc),
+            Paragraph(escape(str(row.get("Description", ""))), tc), Paragraph(f"{float(row.get('Amount', 0)):,.2f}", tr),
+            Paragraph(escape(str(row.get("Currency", ""))), tc), Paragraph(escape(str(row.get("Direction", ""))), tc),
+            Paragraph(escape(str(row.get("Type", ""))), tc), Paragraph(escape(str(row.get("Category", "Uncategorized"))), tc),
+            Paragraph(f"{float(row.get('Confidence', 0)):.1f}%", tr), Paragraph("Yes" if bool(row.get("Review", False)) else "No", tc),
+        ])
+    widths = [doc.width*.075,doc.width*.145,doc.width*.205,doc.width*.09,doc.width*.065,doc.width*.075,doc.width*.09,doc.width*.105,doc.width*.075,doc.width*.075]
+    ledger = Table(rows, colWidths=widths, repeatRows=1, splitByRow=1)
+    ledger.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#4F46E5")), ("GRID", (0,0), (-1,-1), .25, colors.HexColor("#E2E8F0")),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#F8FAFC")]), ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("LEFTPADDING", (0,0), (-1,-1), 3), ("RIGHTPADDING", (0,0), (-1,-1), 3), ("TOPPADDING", (0,0), (-1,-1), 3), ("BOTTOMPADDING", (0,0), (-1,-1), 3),
+    ]))
+    story.append(ledger)
+    doc.build(story)
+    return buffer.getvalue()
 
 
 def get_currency(transactions):
@@ -2629,65 +3237,6 @@ def spending_insights(transactions):
     }
 
 
-class FinoraPDFPasswordError(Exception):
-    """Customer-safe PDF password validation error."""
-
-
-def _validate_pdf_password(uploaded, password):
-    """Validate encrypted PDFs before running the universal pipeline.
-
-    This gives the UI a precise message for a missing or incorrect password
-    instead of allowing the PDF reader to fail later with a generic error.
-    """
-    filename = str(getattr(uploaded, "name", "")).lower()
-    if not filename.endswith(".pdf") or PdfReader is None:
-        return
-
-    try:
-        raw = uploaded.getvalue()
-        reader = PdfReader(io.BytesIO(raw), strict=False)
-    except Exception:
-        # Let the universal pipeline handle malformed/non-standard PDFs.
-        return
-
-    if not getattr(reader, "is_encrypted", False):
-        return
-
-    clean_password = str(password or "")
-    if not clean_password:
-        raise FinoraPDFPasswordError("PDF_PASSWORD_REQUIRED")
-
-    try:
-        result = reader.decrypt(clean_password)
-    except Exception:
-        result = 0
-
-    if not result:
-        raise FinoraPDFPasswordError("INCORRECT_PDF_PASSWORD")
-
-
-def _restore_transaction_session():
-    """Restore transactions from the session backup after a Streamlit rerun."""
-    current = st.session_state.get("transactions") or []
-    backup = st.session_state.get("transactions_backup") or []
-
-    if current:
-        return current
-    if not backup:
-        return []
-
-    restored = []
-    for item in backup:
-        try:
-            restored.append(Transaction.model_validate(item))
-        except Exception:
-            # A stale backup should never crash the UI.
-            continue
-
-    st.session_state.transactions = restored
-    return restored
-
-
 def _analyze_uploaded_statement(uploaded, password, loader_placeholder=None):
     """Run the existing universal pipeline from any UI entry point."""
     os.makedirs("storage", exist_ok=True)
@@ -2741,38 +3290,48 @@ def _analyze_uploaded_statement(uploaded, password, loader_placeholder=None):
 
     time.sleep(0.15)
 
-    # Validate encrypted PDFs before starting the expensive analysis.
-    _validate_pdf_password(uploaded, password)
-
     pipeline = FinancialStatementPipeline(
         file_path=file_path,
         password=password or None,
     )
 
-    result = pipeline.run()
+    result = list(pipeline.run() or [])
 
-    # Keep both the live objects and a Pydantic-safe backup. This prevents
-    # navigation/reruns from making the Transactions and AI pages appear empty.
-    st.session_state.transactions = list(result or [])
-    st.session_state.transactions_backup = [
-        transaction.model_dump(mode="json")
-        for transaction in st.session_state.transactions
-    ]
+    # Save the successful extraction BEFORE running any optional V2 logic.
+    # If the browser disconnects or categorization encounters an error, the
+    # extracted transactions can still be restored on the next Streamlit run.
+    st.session_state.transactions = result
+    _save_transaction_backup(result)
+
+    # V2: classify transactions immediately and apply previously learned
+    # merchant/category mappings before the dashboard is rendered.
+    try:
+        engine = HybridCategoryEngine(CategoryMemory())
+        engine.classify_transactions(result)
+        st.session_state.category_engine = engine
+        # Save the categorized version as well.
+        _save_transaction_backup(result)
+    except Exception:
+        # Categorization must never destroy a successful extraction.
+        st.session_state.category_engine = None
+
     st.session_state.file_name = uploaded.name
-
-    # A newly analyzed statement starts with a clean transaction view.
-    # Do not carry filters/focus from a previous statement into the new one.
-    st.session_state.transaction_search = ""
-    st.session_state.transaction_direction = "All"
-    st.session_state.transaction_status = "All"
-    st.session_state.transaction_category = "All"
-    st.session_state.transaction_focus = None
-    st.session_state.transaction_filter_file = uploaded.name
-
+    st.session_state.upload_mode = False
     st.session_state.chat_history = []
     st.session_state.ai_summary = None
-    st.session_state.page = "Overview"
-    st.query_params["page"] = "Overview"
+    st.session_state.category_review_skipped = False
+
+    review_count = sum(
+        bool(getattr(transaction, "requires_review", False))
+        for transaction in result
+    )
+
+    if review_count > 0:
+        st.session_state.page = "Review"
+        st.query_params["page"] = "Review"
+    else:
+        st.session_state.page = "Overview"
+        st.query_params["page"] = "Overview"
 
 
 def build_ai_context(transactions):
@@ -3106,59 +3665,76 @@ STRICT RULES:
 
 
 # ============================================================
-# TOP NAVIGATION — SESSION-PRESERVING CONTROLS
+# TOP NAVIGATION — NATIVE BROWSER LINKS
 # ============================================================
 
-transactions = _restore_transaction_session()
-
-nav_brand, nav_links, nav_status = st.columns([3.3, 5.2, 1.25])
+nav_brand, nav_links, nav_actions = st.columns([3.0, 5.0, 1.8])
 
 with nav_brand:
     render("""
-    <div class="topbar">
-        <div class="brand">
-            <div class="logo finora-f-logo">F</div>
-            <div>
-                <div class="brand-name">Finora AI</div>
-                <div class="brand-sub">Intelligent Financial Intelligence</div>
+    <a class="finora-brand-link" href="?page=Home&new=1" title="Go to Finora AI home">
+        <div class="topbar">
+            <div class="brand">
+                <div class="logo finora-f-logo">F</div>
+                <div>
+                    <div class="brand-name">Finora AI</div>
+                    <div class="brand-sub">Intelligent Financial Intelligence</div>
+                </div>
             </div>
         </div>
-    </div>
+    </a>
     """)
 
 with nav_links:
-    nav1, nav2, nav3 = st.columns(3)
+    active = st.session_state.page
+    active_label = "AI Intelligence" if active == "AI" else active
+    if active_label not in {"Overview", "Transactions", "AI Intelligence"}:
+        active_label = "Overview"
 
-    with nav1:
-        if st.button("Overview", key="nav_overview", width="stretch"):
-            st.session_state.page = "Overview" if transactions else "Home"
-            st.query_params["page"] = st.session_state.page
-            st.rerun()
+    def nav_link(label, page):
+        active_class = " active" if active_label == label else ""
+        return f'<a class="finora-nav-link{active_class}" href="?page={page}">{label}</a>'
 
-    with nav2:
-        if st.button("Transactions", key="nav_transactions", width="stretch"):
-            if transactions:
-                st.session_state.page = "Transactions"
-                st.query_params["page"] = "Transactions"
-                st.rerun()
-            else:
-                st.session_state.page = "Home"
-                st.query_params["page"] = "Home"
-                st.rerun()
+    if active == "Review":
+        render("""
+        <div class="finora-nav">
+            <div class="finora-nav-link active">Category Review</div>
+        </div>
+        """)
+    else:
+        render(f"""
+        <div class="finora-nav">
+            {nav_link("Overview", "Overview")}
+            {nav_link("Transactions", "Transactions")}
+            {nav_link("AI Intelligence", "AI")}
+        </div>
+        """)
 
-    with nav3:
-        if st.button("AI Intelligence", key="nav_ai", width="stretch"):
-            if transactions:
-                st.session_state.page = "AI"
-                st.query_params["page"] = "AI"
-                st.rerun()
-            else:
-                st.session_state.page = "Home"
-                st.query_params["page"] = "Home"
-                st.rerun()
+with nav_actions:
+    new_statement_clicked = st.button(
+        "＋ New Statement",
+        key="global_new_statement",
+        width="stretch",
+    )
+    if new_statement_clicked:
+        # Explicitly enter upload mode. We do not restore the previous
+        # statement from disk while the user is choosing a new one.
+        st.session_state.upload_mode = True
+        st.session_state.transactions = []
+        st.session_state.transactions_backup = []
+        st.session_state.file_name = None
+        st.session_state.chat_history = []
+        st.session_state.ai_summary = None
+        st.session_state.category_engine = None
+        st.session_state.transaction_focus = None
+        st.session_state.category_review_skipped = False
+        st.session_state.page = "Home"
+        st.query_params["page"] = "Upload"
+        st.rerun()
+    render("""<div class="ai-ready" style="margin-top:7px;text-align:center;">● AI READY</div>""")
 
-with nav_status:
-    render("""<div class="ai-ready" style="margin-top:9px;text-align:center;">● AI READY</div>""")
+
+transactions = st.session_state.transactions
 
 
 # ============================================================
@@ -3281,18 +3857,6 @@ if not transactions and st.session_state.page in {
 
                     st.rerun()
 
-                except FinoraPDFPasswordError as exc:
-                    loader.empty()
-
-                    if str(exc) == "PDF_PASSWORD_REQUIRED":
-                        st.warning(
-                            "🔐 This PDF is password protected. Please enter the PDF password to continue."
-                        )
-                    else:
-                        st.error(
-                            "🔐 The password you entered is incorrect. Please check the password and try again."
-                        )
-
                 except Exception as exc:
                     loader.empty()
 
@@ -3309,14 +3873,18 @@ if not transactions and st.session_state.page in {
                     )
 
                     if password_related:
-                        st.error(
-                            "🔐 The password you entered is incorrect. Please check the password and try again."
+                        st.warning(
+                            "Incorrect PDF password. Please enter the correct "
+                            "password and try again."
                         )
                     else:
                         st.error(
-                            "Finora could not read this statement. Please check the file and try again."
+                            "Finora could not read this statement. "
+                            "Please check the file and try again."
                         )
 
+                    # Keep the technical exception out of the customer-facing UI.
+                    # It can still be inspected in the terminal during development.
                     print(f"Finora analysis error: {exc}")
 
     # --------------------------------------------------------
@@ -3579,6 +4147,363 @@ def render_ai_assistant_page(transactions):
         render("</div>")
 
 
+
+# ============================================================
+# V2 CATEGORY REVIEW — BETWEEN EXTRACTION AND ANALYTICS
+# ============================================================
+
+if st.session_state.page == "Review":
+    review_transactions = list(st.session_state.get("transactions") or [])
+
+    if not review_transactions:
+        st.session_state.page = "Home"
+        st.query_params["page"] = "Overview"
+        st.rerun()
+
+    review_engine = st.session_state.get("category_engine")
+
+    if review_engine is None:
+        review_engine = HybridCategoryEngine(CategoryMemory())
+        review_engine.classify_transactions(review_transactions)
+        st.session_state.category_engine = review_engine
+        _save_transaction_backup(review_transactions)
+
+    review_items = review_engine.review_items(review_transactions)
+    total_transactions = len(review_transactions)
+    needs_review = len(review_items)
+    categorized_count = total_transactions - needs_review
+    progress = categorized_count / total_transactions if total_transactions else 1.0
+
+    if needs_review == 0:
+        st.session_state.category_review_skipped = False
+        st.session_state.page = "Overview"
+        st.query_params["page"] = "Overview"
+        st.rerun()
+
+    render(f"""
+    <div class="category-review-shell">
+        <div class="category-review-kicker">FINORA AI · CATEGORY REVIEW</div>
+
+        <div class="category-review-title">
+            Let's organize your transactions.
+        </div>
+
+        <div class="category-review-subtitle">
+            Finora extracted <strong>{total_transactions:,}</strong> transactions.
+            The transactions it can identify confidently are already categorized.
+            Review the remaining ones so your food, healthcare, entertainment,
+            shopping and other spending totals are as accurate as possible.
+        </div>
+
+        <div class="category-review-summary">
+            <div class="category-review-stat">
+                <div class="category-review-stat-label">Transactions analyzed</div>
+                <div class="category-review-stat-value">{total_transactions:,}</div>
+                <div class="category-review-stat-sub">Universal extraction completed</div>
+            </div>
+
+            <div class="category-review-stat">
+                <div class="category-review-stat-label">Automatically categorized</div>
+                <div class="category-review-stat-value">{categorized_count:,}</div>
+                <div class="category-review-stat-sub">Ready for financial analysis</div>
+            </div>
+
+            <div class="category-review-stat">
+                <div class="category-review-stat-label">Need your attention</div>
+                <div class="category-review-stat-value">{needs_review:,}</div>
+                <div class="category-review-stat-sub">Your choices improve future statements</div>
+            </div>
+        </div>
+
+        <div class="category-review-progress">
+            <span style="width:{progress * 100:.1f}%"></span>
+        </div>
+
+        <div class="category-review-progress-label">
+            <span>{categorized_count:,} categorized</span>
+            <span>{needs_review:,} remaining</span>
+        </div>
+    </div>
+    """)
+
+    head_left, head_right = st.columns([5.2, 1.0])
+
+    with head_left:
+        st.markdown(f"### Needs your attention · {needs_review:,}")
+
+    with head_right:
+        if st.button(
+            "✕ Continue",
+            key="category_review_close",
+            width="stretch",
+        ):
+            # X means "continue without resolving the remaining items".
+            # We intentionally keep them as Uncategorized/Review in the data.
+            st.session_state.category_review_skipped = True
+            st.session_state.page = "Overview"
+            st.query_params["page"] = "Overview"
+            st.rerun()
+
+    st.caption(
+        "Choose a category for each transaction. "
+        "Use 'Apply to all matching transactions' when the same merchant appears multiple times."
+    )
+
+    with st.container(height=680, border=True):
+        for item in review_items:
+            index = item["index"]
+            tx = item["transaction"]
+
+            merchant = str(
+                getattr(tx, "merchant", None)
+                or getattr(tx, "description_raw", None)
+                or "Unknown merchant"
+            ).strip()
+
+            description = str(
+                getattr(tx, "description_raw", "") or ""
+            ).strip()
+
+            amount = number(getattr(tx, "original_amount", 0))
+            tx_currency = str(
+                getattr(tx, "original_currency", currency) or currency
+            )
+
+            date_value = getattr(tx, "transaction_date", None)
+            date_text = (
+                date_value.strftime("%d %b %Y")
+                if date_value
+                else "Date unavailable"
+            )
+
+            suggested = item.get("suggested_category")
+            confidence = float(item.get("confidence", 0.0) or 0.0)
+
+            render(f"""
+            <div class="category-review-card">
+                <div style="display:flex;justify-content:space-between;gap:20px;align-items:flex-start;">
+                    <div style="min-width:0;">
+                        <div class="category-review-merchant">{escape(merchant)}</div>
+                        <div class="category-review-description">
+                            {escape(description)} · {escape(date_text)}
+                        </div>
+                        {"<div class='category-review-suggestion'>Finora suggests "
+                         + escape(str(suggested))
+                         + f" · {confidence:.0%} confidence</div>"
+                         if suggested else ""}
+                    </div>
+
+                    <div class="category-review-amount">
+                        {escape(tx_currency)} {amount:,.2f}
+                    </div>
+                </div>
+            </div>
+            """)
+
+            category_choices = review_engine.available_categories()
+
+            if suggested and suggested in category_choices:
+                category_choices = [
+                    suggested,
+                    *[
+                        value for value in category_choices
+                        if value != suggested
+                    ],
+                ]
+
+            create_option = "＋ Create new category"
+
+            selected_category = st.selectbox(
+                "Category",
+                [create_option] + category_choices,
+                index=1 if suggested and suggested in category_choices else 0,
+                key=f"review_category_{index}",
+            )
+
+            if selected_category == create_option:
+                with st.container(border=True):
+                    st.markdown("**Create your own category**")
+
+                    new_category = st.text_input(
+                        "Category name",
+                        placeholder="e.g. Business Expenses",
+                        key=f"review_new_category_{index}",
+                    )
+
+                    new_subcategory = st.text_input(
+                        "Subcategory",
+                        placeholder="e.g. Client Meetings",
+                        key=f"review_new_subcategory_{index}",
+                    )
+
+                    apply_custom_all = st.checkbox(
+                        "Apply to all matching transactions",
+                        value=True,
+                        key=f"review_new_all_{index}",
+                    )
+
+                    if st.button(
+                        "Create & Apply →",
+                        key=f"review_create_apply_{index}",
+                        type="primary",
+                        width="stretch",
+                    ):
+                        clean_name = new_category.strip()
+                        clean_subcategory = (
+                            new_subcategory.strip() or "General"
+                        )
+
+                        if not clean_name:
+                            st.warning("Enter a category name first.")
+                        else:
+                            review_engine.create_custom_category(
+                                clean_name,
+                                clean_subcategory,
+                            )
+
+                            review_engine.learn_from_user(
+                                tx,
+                                clean_name,
+                                clean_subcategory,
+                                apply_all=apply_custom_all,
+                                transactions=review_transactions,
+                            )
+
+                            st.session_state.transactions = review_transactions
+                            st.session_state.category_engine = review_engine
+                            _save_transaction_backup(review_transactions)
+                            st.rerun()
+
+            else:
+                subcategories = review_engine.subcategories_for(
+                    selected_category
+                )
+
+                selected_subcategory = st.selectbox(
+                    "Subcategory",
+                    ["General"] + [
+                        value
+                        for value in subcategories
+                        if value != "General"
+                    ],
+                    key=f"review_subcategory_{index}",
+                )
+
+                apply_all = st.checkbox(
+                    "Apply to all matching transactions",
+                    value=False,
+                    key=f"review_apply_all_{index}",
+                )
+
+                if apply_all:
+                    target_key = merchant_key(tx)
+                    matching_count = sum(
+                        1
+                        for other in review_transactions
+                        if merchant_key(other) == target_key
+                    )
+                    st.caption(
+                        f"{matching_count} matching transaction(s) will be updated."
+                    )
+
+                b1, b2 = st.columns(2)
+
+                with b1:
+                    if st.button(
+                        "Save & Next →",
+                        key=f"review_save_{index}",
+                        type="primary",
+                        width="stretch",
+                    ):
+                        review_engine.learn_from_user(
+                            tx,
+                            selected_category,
+                            (
+                                None
+                                if selected_subcategory == "General"
+                                else selected_subcategory
+                            ),
+                            apply_all=apply_all,
+                            transactions=review_transactions,
+                        )
+
+                        st.session_state.transactions = review_transactions
+                        st.session_state.category_engine = review_engine
+                        _save_transaction_backup(review_transactions)
+                        st.rerun()
+
+                with b2:
+                    if st.button(
+                        "Leave uncategorized",
+                        key=f"review_leave_{index}",
+                        width="stretch",
+                    ):
+                        tx.category = "Uncategorized"
+                        tx.subcategory = "Uncategorized"
+                        tx.category_confidence = 0.0
+                        tx.requires_review = False
+
+                        st.session_state.transactions = review_transactions
+                        st.session_state.category_engine = review_engine
+                        _save_transaction_backup(review_transactions)
+                        st.rerun()
+
+            st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+    remaining = len(review_engine.review_items(review_transactions))
+
+    render(f"""
+    <div class="category-review-footer">
+        <div class="category-review-footer-text">
+            <strong>{remaining:,}</strong> transaction(s) still need attention.
+            Saved choices are written directly into Finora's transaction data
+            and will feed the spending dashboard, Transactions page and AI.
+        </div>
+    </div>
+    """)
+
+    st.stop()
+
+
+
+# ============================================================
+# FINORA VISUAL CATEGORY HELPERS
+# ============================================================
+
+CATEGORY_ICONS = {
+    "Food & Dining": "🍔",
+    "Groceries": "🛒",
+    "Transportation": "🚗",
+    "Housing": "🏠",
+    "Bills & Utilities": "💡",
+    "Healthcare": "🏥",
+    "Shopping": "🛍️",
+    "Entertainment": "🎬",
+    "Travel": "✈️",
+    "Education": "🎓",
+    "Financial": "💳",
+    "Income": "💰",
+    "Transfers": "🔄",
+    "Investments": "📈",
+    "Cash": "🏧",
+    "Taxes & Government": "🏛️",
+    "Other": "📦",
+    "Other/Services": "🧾",
+    "Uncategorized": "❓",
+    "Unknown": "❔",
+}
+
+def category_icon(name):
+    value = str(name or "").strip()
+    return CATEGORY_ICONS.get(value, "•")
+
+def category_display_name(name, use_icon=True):
+    value = str(name or "").strip() or "Unknown"
+    if use_icon:
+        return f"{category_icon(value)}  {value}"
+    return value
+
+
 # ============================================================
 # OVERVIEW
 # ============================================================
@@ -3693,7 +4618,7 @@ if st.session_state.page == "Overview":
         <div class="cockpit-metrics">
 
             <div class="cockpit-metric">
-                <div class="cockpit-metric-label">Received</div>
+                <div class="cockpit-metric-label">💰 Received</div>
                 <div class="cockpit-metric-value">
                     {money(income, currency)}
                 </div>
@@ -3703,7 +4628,7 @@ if st.session_state.page == "Overview":
             </div>
 
             <div class="cockpit-metric">
-                <div class="cockpit-metric-label">Spent</div>
+                <div class="cockpit-metric-label">💸 Spent</div>
                 <div class="cockpit-metric-value">
                     {money(expenses, currency)}
                 </div>
@@ -3713,7 +4638,7 @@ if st.session_state.page == "Overview":
             </div>
 
             <div class="cockpit-metric">
-                <div class="cockpit-metric-label">Net position</div>
+                <div class="cockpit-metric-label">📊 Net position</div>
                 <div class="cockpit-metric-value">
                     {money(net_cash_flow, currency)}
                 </div>
@@ -3723,7 +4648,7 @@ if st.session_state.page == "Overview":
             </div>
 
             <div class="cockpit-metric">
-                <div class="cockpit-metric-label">Activity</div>
+                <div class="cockpit-metric-label">🧾 Activity</div>
                 <div class="cockpit-metric-value">
                     {len(transactions):,}
                 </div>
@@ -3736,6 +4661,37 @@ if st.session_state.page == "Overview":
 
     </div>
     """)
+
+    # --------------------------------------------------------
+    # DOWNLOADABLE FINANCIAL REPORT
+    # --------------------------------------------------------
+
+    pdf_bytes = build_finora_pdf_report(
+        transactions,
+        file_name=st.session_state.get("file_name"),
+        ai_summary=st.session_state.get("ai_summary"),
+    )
+
+    render("""
+    <div class="pdf-report-card">
+        <div class="pdf-report-copy">
+            <div class="pdf-report-icon">PDF</div>
+            <div>
+                <div class="pdf-report-title">Download your complete Finora report</div>
+                <div class="pdf-report-sub">Overview, spending categories, top merchants, Finora intelligence and every transaction in one polished PDF.</div>
+            </div>
+        </div>
+    </div>
+    """)
+
+    st.download_button(
+        "Download complete statement report · PDF",
+        data=pdf_bytes,
+        file_name="finora_statement_report.pdf",
+        mime="application/pdf",
+        key="download_finora_pdf_report",
+        width="stretch",
+    )
 
     # --------------------------------------------------------
     # QUICK INTELLIGENCE
@@ -3870,8 +4826,7 @@ if st.session_state.page == "Overview":
 
         <div class="intel-head">
             <div>
-                <div class="intel-title">
-                    Where the money went
+                <div class="intel-title intel-title-line"><span class="section-icon">💳</span>Where the money went
                 </div>
                 <div class="intel-sub">
                     The largest outgoing areas appear first.
@@ -3888,6 +4843,28 @@ if st.session_state.page == "Overview":
 
     </div>
     """)
+
+    if has_categories and not spend_source.empty:
+        mini_items = spend_source.head(4).copy()
+        mini_total = float(expenses) if float(expenses) > 0 else 0.0
+
+        mini_html = '<div class="category-summary-strip">'
+        for _, mini_row in mini_items.iterrows():
+            mini_name = str(mini_row["Category"])
+            mini_amount = float(mini_row["Amount"])
+            mini_share = (mini_amount / mini_total * 100) if mini_total else 0
+            mini_html += f"""
+            <div class="category-mini">
+                <div class="category-mini-top">
+                    <span class="category-mini-icon">{category_icon(mini_name)}</span>
+                    <span>{escape(mini_name)}</span>
+                </div>
+                <div class="category-mini-value">{money(mini_amount, currency)}</div>
+                <div class="category-mini-share">{mini_share:.1f}% of outgoing</div>
+            </div>
+            """
+        mini_html += "</div>"
+        render(mini_html)
 
     rank_col, flow_col = st.columns(
         [1.0, 1.0],
@@ -3923,6 +4900,12 @@ if st.session_state.page == "Overview":
                     else _display_spend_name(raw_name)
                 )
 
+                display_icon = (
+                    category_icon(raw_name)
+                    if has_categories
+                    else "🏪"
+                )
+
                 amount = float(row["Amount"])
 
                 share = (
@@ -3944,6 +4927,10 @@ if st.session_state.page == "Overview":
 
                         <div class="rank-number">
                             {position:02d}
+                        </div>
+
+                        <div class="rank-icon">
+                            {display_icon}
                         </div>
 
                         <div class="rank-name">
@@ -3986,8 +4973,7 @@ if st.session_state.page == "Overview":
         render("""
         <div class="flow-card">
 
-            <div class="intel-title">
-                How money moved
+            <div class="intel-title intel-title-line"><span class="section-icon">📈</span>How money moved
             </div>
 
             <div class="intel-sub">
@@ -4379,135 +5365,177 @@ if st.session_state.page == "Transactions":
     </div>
     """)
 
+    # IMPORTANT: always read the canonical transaction list directly from
+    # session_state on this page. This prevents the table from becoming empty
+    # because of a stale/derived dataframe after Streamlit reruns.
+    transaction_source = list(
+        st.session_state.get("transactions") or []
+    )
+
+    transaction_df = make_dataframe(transaction_source)
+
+    if transaction_df.empty and transaction_source:
+        # Defensive fallback: rebuild directly from the canonical objects.
+        transaction_df = pd.DataFrame(
+            [transaction_dict(t) for t in transaction_source]
+        )
+
     c1, c2, c3, c4 = st.columns(4)
 
     with c1:
         search = st.text_input(
             "Search",
             placeholder="Merchant or description...",
-            key="transaction_search",
+            key="transaction_search_v2",
         )
 
     with c2:
         direction = st.selectbox(
             "Direction",
             ["All", "credit", "debit"],
-            key="transaction_direction",
+            key="transaction_direction_v2",
         )
 
     with c3:
         status = st.selectbox(
             "Status",
             ["All", "Needs Review", "Validated"],
-            key="transaction_status",
+            key="transaction_status_v2",
         )
 
     with c4:
-        categories = sorted({
+        category_values = sorted({
             str(value).strip()
-            for value in df.get("Category", pd.Series(dtype=str)).dropna().tolist()
+            for value in transaction_df.get(
+                "Category",
+                pd.Series(dtype=str),
+            ).dropna().tolist()
             if str(value).strip()
         })
         category_filter = st.selectbox(
             "Category",
-            ["All"] + categories,
-            key="transaction_category",
+            ["All"] + category_values,
+            key="transaction_category_v2",
         )
 
-    # Transaction filters are statement-scoped. If this is the first visit to
-    # Transactions for the currently loaded statement, initialize them cleanly.
-    current_file = st.session_state.get("file_name") or ""
-    filter_file = st.session_state.get("transaction_filter_file")
-    if filter_file != current_file:
-        st.session_state.transaction_search = ""
-        st.session_state.transaction_direction = "All"
-        st.session_state.transaction_status = "All"
-        st.session_state.transaction_category = "All"
-        st.session_state.transaction_focus = None
-        st.session_state.transaction_filter_file = current_file
-        st.rerun()
+    filtered = transaction_df.copy()
 
-    filtered = df.copy()
     focus = st.session_state.get("transaction_focus")
-    if focus and focus.get("value"):
+    if focus and focus.get("value") and not filtered.empty:
         focus_value = _safe_focus_value(focus.get("value"))
         focus_kind = str(focus.get("kind") or "").casefold()
 
         if focus_kind == "category" and "Category" in filtered.columns:
-            candidate = filtered[
-                filtered["Category"].fillna("").astype(str).str.casefold()
+            filtered = filtered[
+                filtered["Category"]
+                .fillna("")
+                .astype(str)
+                .str.casefold()
                 == focus_value.casefold()
             ]
         elif focus_kind == "merchant" and "Merchant" in filtered.columns:
-            candidate = filtered[
-                filtered["Merchant"].fillna("").astype(str).str.casefold()
+            filtered = filtered[
+                filtered["Merchant"]
+                .fillna("")
+                .astype(str)
+                .str.casefold()
                 == focus_value.casefold()
             ]
-        else:
-            candidate = filtered
 
-        # Never let an old/broken focus filter make the entire table appear
-        # empty. A focus action is only applied when it actually matches data.
-        if len(candidate) > 0:
-            filtered = candidate
-            render(
-                f"<div class='focus-filter-banner'>"
-                f"Showing transactions for <strong>{escape(focus_value)}</strong>. "
-                f"<span>Clear the filter below to see all transactions.</span>"
-                f"</div>"
-            )
-        else:
-            st.session_state.transaction_focus = None
+        render(
+            f"<div class='focus-filter-banner'>"
+            f"Showing transactions for <strong>{escape(focus_value)}</strong>. "
+            f"Use the controls below to narrow the view further."
+            f"</div>"
+        )
 
-    if search.strip():
-        query = search.strip()
-        merchant_text = filtered["Merchant"].fillna("").astype(str)
-        description_text = filtered["Description"].fillna("").astype(str)
+    if search and not filtered.empty:
+        merchant_match = (
+            filtered["Merchant"]
+            .fillna("")
+            .astype(str)
+            .str.contains(search, case=False, na=False)
+        )
+        description_match = (
+            filtered["Description"]
+            .fillna("")
+            .astype(str)
+            .str.contains(search, case=False, na=False)
+        )
+        filtered = filtered[merchant_match | description_match]
+
+    if direction != "All" and not filtered.empty:
         filtered = filtered[
-            merchant_text.str.contains(query, case=False, na=False, regex=False)
-            | description_text.str.contains(query, case=False, na=False, regex=False)
+            filtered["Direction"].astype(str).str.lower()
+            == direction.lower()
         ]
 
-    if direction != "All":
-        filtered = filtered[
-            filtered["Direction"].fillna("").astype(str).str.casefold()
-            == direction.casefold()
-        ]
+    if status == "Needs Review" and not filtered.empty:
+        filtered = filtered[filtered["Review"] == True]
+    elif status == "Validated" and not filtered.empty:
+        filtered = filtered[filtered["Review"] == False]
 
-    if status == "Needs Review":
-        filtered = filtered[filtered["Review"].fillna(False).astype(bool)]
-    elif status == "Validated":
-        filtered = filtered[~filtered["Review"].fillna(False).astype(bool)]
-
-    if category_filter != "All" and "Category" in filtered.columns:
+    if category_filter != "All" and not filtered.empty:
         filtered = filtered[
-            filtered["Category"].fillna("").astype(str).str.casefold()
-            == category_filter.casefold()
+            filtered["Category"].fillna("").astype(str)
+            == category_filter
         ]
 
     st.caption(
-        f"{len(filtered):,} transactions"
+        f"{len(filtered):,} of {len(transaction_source):,} transactions"
     )
 
-    st.dataframe(
-        filtered,
-        width="stretch",
-        hide_index=True,
-        height=600,
-    )
+    if not transaction_source:
+        st.warning(
+            "No analyzed transactions are currently stored in this session. "
+            "Return to Overview and analyze the statement again."
+        )
+    elif filtered.empty:
+        st.info(
+            "No transactions match the selected filters. "
+            "Set Direction, Status and Category to All and clear Search."
+        )
+    else:
+        display_columns = [
+            "Date",
+            "Merchant",
+            "Description",
+            "Amount",
+            "Currency",
+            "Direction",
+            "Type",
+            "Category",
+            "Confidence",
+            "Review",
+        ]
+        display_columns = [
+            column
+            for column in display_columns
+            if column in filtered.columns
+        ]
+
+        st.dataframe(
+            filtered[display_columns],
+            width="stretch",
+            hide_index=True,
+            height=600,
+        )
 
     if focus and focus.get("value"):
-        if st.button("Clear focused transaction view", key="clear_transaction_focus"):
+        if st.button(
+            "Clear focused transaction view",
+            key="clear_transaction_focus_v2",
+        ):
             st.session_state.transaction_focus = None
+            st.query_params["page"] = "Transactions"
             st.rerun()
 
     st.download_button(
         "Download CSV",
-        filtered.to_csv(
-            index=False
-        ).encode("utf-8"),
+        filtered.to_csv(index=False).encode("utf-8"),
         "finora_transactions.csv",
         "text/csv",
+        key="download_transactions_v2",
     )
 
 
