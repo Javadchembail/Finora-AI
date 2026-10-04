@@ -30,101 +30,160 @@ BASE_CATEGORIES: Dict[str, List[str]] = {
 }
 
 RULES: List[Tuple[str, str, str, Tuple[str, ...], float]] = [
-    # Food & Dining
     ("Swiggy", "Food & Dining", "Food Delivery", ("swiggy",), 0.99),
     ("Zomato", "Food & Dining", "Food Delivery", ("zomato",), 0.99),
-    ("Talabat", "Food & Dining", "Food Delivery", ("talabat",), 0.99),
-    ("Deliveroo", "Food & Dining", "Food Delivery", ("deliveroo",), 0.99),
-    ("Careem Food", "Food & Dining", "Food Delivery", ("careem food",), 0.99),
     ("KFC", "Food & Dining", "Fast Food", ("kfc",), 0.99),
     ("McDonald's", "Food & Dining", "Fast Food", ("mcdonald", "mcdonalds"), 0.99),
-    ("Burger King", "Food & Dining", "Fast Food", ("burger king",), 0.99),
     ("Starbucks", "Food & Dining", "Cafe", ("starbucks",), 0.99),
-    ("Costa Coffee", "Food & Dining", "Cafe", ("costa coffee",), 0.98),
-    ("Restaurant", "Food & Dining", "Restaurant", ("restaurant", "rest.", "rest "), 0.94),
-    ("Cafe", "Food & Dining", "Cafe", ("cafe", "coffee shop", "cafeteria"), 0.94),
-    ("Bakery", "Food & Dining", "Bakery", ("bakery",), 0.95),
-    ("Food Delivery", "Food & Dining", "Food Delivery", ("food delivery", "food order"), 0.94),
-
-    # Entertainment
     ("BookMyShow", "Entertainment", "Movies", ("bookmyshow",), 0.99),
     ("Star Cinemas", "Entertainment", "Movies", ("star cinemas", "starcinemas"), 0.98),
-    ("Cinema", "Entertainment", "Movies", ("cinema", "cinemas", "multiplex"), 0.96),
     ("Netflix", "Entertainment", "Streaming", ("netflix",), 0.99),
     ("Amazon Prime", "Entertainment", "Streaming", ("amazon prime",), 0.98),
-    ("Disney+", "Entertainment", "Streaming", ("disney plus", "disney+"), 0.98),
-    ("Spotify", "Entertainment", "Music", ("spotify",), 0.98),
-    ("Gaming", "Entertainment", "Gaming", ("playstation", "xbox", "steam games", "gaming"), 0.95),
-    ("Events", "Entertainment", "Events", ("event ticket", "events", "ticketing"), 0.92),
-
-    # Healthcare
-    ("Medeor Medicals", "Healthcare", "Pharmacy", ("medeor medicals", "medeor pharmacy"), 0.99),
+    ("ADNOC", "Transportation", "Fuel", ("adnoc",), 0.88),
     ("Aster Pharmacy", "Healthcare", "Pharmacy", ("aster pharmacy",), 0.99),
     ("Life Pharmacy", "Healthcare", "Pharmacy", ("life pharmacy",), 0.99),
-    ("Pharmacy", "Healthcare", "Pharmacy", ("pharmacy", "medical store", "medicals", "chemist"), 0.96),
-    ("Hospital", "Healthcare", "Hospital", ("hospital", "clinic", "medical center", "medical centre"), 0.96),
-    ("Doctor", "Healthcare", "Doctor", ("doctor", "dr.", "physician"), 0.93),
-    ("Diagnostics", "Healthcare", "Diagnostics", ("diagnostic", "laboratory", "lab test", "pathology"), 0.94),
-    ("Health Insurance", "Healthcare", "Health Insurance", ("health insurance",), 0.97),
-
-    # Groceries
+    ("Medeor", "Healthcare", "Hospital", ("medeor",), 0.96),
+    ("Millennium Hospital", "Healthcare", "Hospital", ("millennium hospital",), 0.99),
     ("Lulu", "Groceries", "Supermarket", ("lulu hypermarket", "luluhypermarket", "lulu"), 0.95),
     ("Carrefour", "Groceries", "Supermarket", ("carrefour",), 0.98),
     ("Nesto", "Groceries", "Supermarket", ("nesto hyper", "nesto"), 0.97),
-    ("Supermarket", "Groceries", "Supermarket", ("supermarket", "hypermarket"), 0.96),
-    ("Grocery Store", "Groceries", "Grocery Store", ("grocery", "groceries", "baqala", "mini mart", "minimart"), 0.94),
-    ("Online Grocery", "Groceries", "Online Grocery", ("blinkit", "instacart", "zepto", "bigbasket"), 0.97),
-
-    # Transportation
-    # Specific ADNOC service descriptions should beat the generic ADNOC fuel rule.
-    ("ADNOC Restaurant", "Food & Dining", "Restaurant", ("adnoc samha rest", "adnoc restaurant"), 0.97),
-    ("ADNOC Car Care", "Transportation", "Vehicle Maintenance", ("adnoc car care", "adnoc carcare"), 0.98),
-    ("ADNOC", "Transportation", "Fuel", ("adnoc",), 0.88),
-    ("Fuel", "Transportation", "Fuel", ("fuel station", "petrol", "gas station", "service station", "fuel"), 0.95),
-    ("Uber", "Transportation", "Ride Sharing", ("uber",), 0.98),
-    ("Careem", "Transportation", "Ride Sharing", ("careem",), 0.98),
-    ("Taxi", "Transportation", "Taxi", ("taxi", "cab"), 0.96),
-    ("Public Transport", "Transportation", "Public Transport", ("metro", "bus", "tram", "public transport"), 0.94),
-    ("Parking", "Transportation", "Parking", ("parking", "car park", "q mobility", "hala car park"), 0.96),
-    ("Tolls", "Transportation", "Tolls", ("toll", "salik"), 0.97),
-    ("Vehicle Maintenance", "Transportation", "Vehicle Maintenance", ("car care", "auto service", "vehicle maintenance", "tyre", "tire"), 0.95),
-
-    # Shopping
-    ("Max", "Shopping", "Clothing", ("max dubai", "max fashion", "max "), 0.94),
+    ("Max", "Shopping", "Clothing", ("max ", "max dubai"), 0.94),
     ("Miniso", "Shopping", "General Shopping", ("miniso",), 0.98),
-    ("Electronics", "Shopping", "Electronics", ("electronics", "computer store", "computer"), 0.91),
-    ("Clothing", "Shopping", "Clothing", ("clothing", "apparel", "fashion"), 0.91),
-    ("Personal Care", "Shopping", "Personal Care", ("salon", "beauty", "spa", "personal care"), 0.91),
-    ("Flowers & Gifts", "Shopping", "Flowers & Gifts", ("flower", "flowers", "gift shop", "gifts"), 0.91),
-
-    # Travel
-    ("Flights", "Travel", "Flights", ("airline", "airways", "flight", "emirates airline", "etihad"), 0.95),
-    ("Hotels", "Travel", "Hotels", ("hotel", "resort"), 0.95),
-    ("Travel Booking", "Travel", "Travel Booking", ("makemytrip", "booking.com", "agoda", "expedia", "cleartrip"), 0.96),
-    ("Visa", "Travel", "Visa", ("visa service", "visa application"), 0.93),
-
-    # Bills & Utilities
-    ("E&", "Bills & Utilities", "Mobile", ("e& digital app", "e& - dubai", "e& digital"), 0.96),
-    ("Mobile", "Bills & Utilities", "Mobile", ("mobile recharge", "mobile bill", "prepaid recharge", "telecom"), 0.94),
-    ("Internet", "Bills & Utilities", "Internet", ("internet bill", "broadband", "fiber internet"), 0.94),
-    ("Electricity", "Bills & Utilities", "Electricity", ("electricity bill", "electricity"), 0.94),
-    ("Water", "Bills & Utilities", "Water", ("water bill",), 0.94),
-    ("Subscription", "Bills & Utilities", "Subscription", ("subscription", "monthly plan"), 0.90),
-
-    # Investments / financial
     ("Zerodha", "Investments", "Brokerage", ("zerodha",), 0.99),
     ("Groww", "Investments", "Brokerage", ("groww",), 0.99),
     ("Upstox", "Investments", "Brokerage", ("upstox",), 0.99),
-    ("Brokerage", "Investments", "Brokerage", ("brokerage", "securities", "demat"), 0.92),
-    ("Bank Fee", "Financial", "Bank Fees", ("bank fee", "service charge", "account fee"), 0.94),
-    ("ATM Fee", "Financial", "ATM Fees", ("atm fee",), 0.95),
-    ("Interest", "Financial", "Interest", ("interest charge", "interest"), 0.90),
-
-    # Transfers / cash — these are intentionally lower confidence for anonymous descriptions.
-    ("ATM Withdrawal", "Cash", "ATM Withdrawal", ("atm withdrawal", "cash withdrawal"), 0.97),
-    ("UPI Transfer", "Transfers", "UPI Transfer", ("upi transfer",), 0.91),
+    ("E&", "Bills & Utilities", "Mobile", ("e& digital app", "e& - dubai", "e& digital"), 0.96),
+    ("Q Mobility", "Transportation", "Parking", ("q mobility",), 0.95),
+    ("Hala", "Transportation", "Parking", ("hala car park",), 0.96),
 ]
 
+
+# Semantic merchant signals used when the exact merchant name is unknown.
+# These are intentionally conservative: they classify only strong business
+# descriptors and leave ambiguous merchants for review.
+SEMANTIC_RULES: List[Tuple[str, str, Tuple[str, ...], float]] = [
+    # FOOD & DINING
+    ("Food & Dining", "Restaurant", (
+        "restaurant", "restauran", "resto", "ristorante", "restaurante",
+        "restauracja", "diner", "eatery", "bistro", "brasserie",
+        "food court", "canteen", "cafeteria", "grill", "kitchen",
+        "steakhouse", "seafood restaurant", "family restaurant",
+    ), 0.97),
+    ("Food & Dining", "Cafe", (
+        "cafe", "coffee shop", "coffeehouse", "coffee house", "espresso bar",
+    ), 0.95),
+    ("Food & Dining", "Fast Food", (
+        "fast food", "burger", "pizza", "fried chicken", "shawarma",
+        "sandwich", "taco", "kfc", "mcdonald", "subway",
+    ), 0.96),
+    ("Food & Dining", "Food Delivery", (
+        "food delivery", "food order", "meal delivery", "food delivery app",
+    ), 0.97),
+    ("Food & Dining", "Bakery", (
+        "bakery", "bakeshop", "patisserie", "confectionery",
+    ), 0.96),
+    ("Food & Dining", "Snacks", (
+        "snack bar", "snacks", "juice bar", "dessert shop",
+    ), 0.93),
+
+    # GROCERIES
+    ("Groceries", "Supermarket", (
+        "supermarket", "hypermarket", "super market",
+    ), 0.97),
+    ("Groceries", "Grocery Store", (
+        "grocery store", "grocery", "groceries", "grocer",
+    ), 0.95),
+    ("Groceries", "Convenience Store", (
+        "convenience store", "mini mart", "minimart", "convenience mart",
+    ), 0.95),
+    ("Groceries", "Fresh Market", (
+        "fresh market", "farmers market", "farm market",
+    ), 0.94),
+
+    # TRANSPORTATION
+    ("Transportation", "Fuel", (
+        "fuel station", "petrol station", "gas station", "service station",
+        "filling station", "gasoline station", "diesel station",
+    ), 0.97),
+    ("Transportation", "Taxi", (
+        "taxi", "cab fare", "taxicab",
+    ), 0.96),
+    ("Transportation", "Ride Sharing", (
+        "ride sharing", "rideshare", "ride share",
+    ), 0.96),
+    ("Transportation", "Public Transport", (
+        "public transport", "bus fare", "train fare", "metro", "subway",
+        "transit",
+    ), 0.95),
+    ("Transportation", "Parking", (
+        "parking", "car park", "parking fee",
+    ), 0.96),
+    ("Transportation", "Tolls", (
+        "toll gate", "road toll", "tollway",
+    ), 0.97),
+
+    # HEALTHCARE
+    ("Healthcare", "Pharmacy", (
+        "pharmacy", "chemist", "drug store", "medical pharmacy",
+    ), 0.97),
+    ("Healthcare", "Hospital", (
+        "hospital", "medical center", "medical centre",
+    ), 0.98),
+    ("Healthcare", "Doctor", (
+        "doctor", "clinic", "medical clinic", "dental clinic", "dentist",
+    ), 0.95),
+    ("Healthcare", "Diagnostics", (
+        "diagnostic center", "diagnostic centre", "diagnostics", "laboratory",
+        "pathology",
+    ), 0.96),
+
+    # BILLS & UTILITIES
+    ("Bills & Utilities", "Electricity", (
+        "electricity bill", "electricity payment", "power bill",
+    ), 0.98),
+    ("Bills & Utilities", "Water", (
+        "water bill", "water payment",
+    ), 0.98),
+    ("Bills & Utilities", "Internet", (
+        "internet bill", "broadband", "wifi bill",
+    ), 0.97),
+    ("Bills & Utilities", "Mobile", (
+        "mobile bill", "mobile recharge", "phone bill", "telecom bill",
+    ), 0.97),
+
+    # SHOPPING
+    ("Shopping", "Clothing", (
+        "clothing", "apparel", "fashion store", "garments",
+    ), 0.94),
+    ("Shopping", "Electronics", (
+        "electronics", "electronic store", "computer store", "mobile store",
+    ), 0.94),
+    ("Shopping", "Home", (
+        "home store", "home decor", "household store",
+    ), 0.94),
+
+    # TRAVEL
+    ("Travel", "Hotels", (
+        "hotel", "resort", "inn", "motel", "guest house",
+    ), 0.97),
+    ("Travel", "Flights", (
+        "airline", "airways", "airport", "flight",
+    ), 0.96),
+
+    # EDUCATION
+    ("Education", "Courses", (
+        "training institute", "training center", "training centre",
+        "coaching center", "coaching centre",
+    ), 0.95),
+
+    # FINANCIAL
+    ("Financial", "Bank Fees", (
+        "bank fee", "bank charge", "account fee", "service charge",
+    ), 0.96),
+    ("Financial", "ATM Fees", (
+        "atm fee", "cash withdrawal fee",
+    ), 0.97),
+]
 
 
 def normalize_text(value: object) -> str:
@@ -220,20 +279,71 @@ class HybridCategoryEngine:
             rows = session.scalars(select(CustomCategory).where(CustomCategory.name == category)).all()
             return [r.subcategory for r in rows]
 
+    def _transaction_text(self, transaction) -> str:
+        values = [
+            getattr(transaction, "merchant", None),
+            getattr(transaction, "description_normalized", None),
+            getattr(transaction, "description_raw", None),
+        ]
+        return normalize_text(" ".join(str(value or "") for value in values))
+
+    @staticmethod
+    def _fuzzy_token_match(text: str, alias: str) -> bool:
+        """Catch common PDF/OCR truncations such as 'restauran' -> 'restaurant'."""
+        normalized_alias = normalize_text(alias)
+        if not normalized_alias or normalized_alias in text:
+            return bool(normalized_alias)
+
+        alias_tokens = normalized_alias.split()
+        text_tokens = text.split()
+        if len(alias_tokens) != 1 or len(normalized_alias) < 6:
+            return False
+
+        alias_token = alias_tokens[0]
+        for token in text_tokens:
+            if abs(len(token) - len(alias_token)) > 2:
+                continue
+            common = 0
+            for left, right in zip(token, alias_token):
+                if left != right:
+                    break
+                common += 1
+            if common >= max(6, len(alias_token) - 2):
+                return True
+        return False
+
     def _rule_classify(self, transaction):
-        text = normalize_text(
-            " ".join(
-                str(x or "")
-                for x in [getattr(transaction, "merchant", None), getattr(transaction, "description_raw", "")]
-            )
-        )
+        text = self._transaction_text(transaction)
         best = None
+
+        # 1) Explicit merchant rules always get first priority.
         for name, category, subcategory, aliases, confidence in RULES:
             for alias in aliases:
-                if normalize_text(alias) and normalize_text(alias) in text:
+                normalized_alias = normalize_text(alias)
+                if normalized_alias and normalized_alias in text:
                     score = confidence
                     if best is None or score > best[2]:
                         best = (category, subcategory, score, name)
+
+        # 2) Semantic descriptors handle unknown/global merchants.
+        for category, subcategory, aliases, confidence in SEMANTIC_RULES:
+            for alias in aliases:
+                normalized_alias = normalize_text(alias)
+                if normalized_alias and normalized_alias in text:
+                    score = confidence
+                    if best is None or score > best[2]:
+                        best = (category, subcategory, score, f"semantic:{alias}")
+
+        # 3) Fuzzy matching is deliberately limited to long single words so
+        # common merchant names do not get incorrectly classified.
+        if best is None:
+            for category, subcategory, aliases, confidence in SEMANTIC_RULES:
+                for alias in aliases:
+                    if self._fuzzy_token_match(text, alias):
+                        score = max(0.90, confidence - 0.02)
+                        if best is None or score > best[2]:
+                            best = (category, subcategory, score, f"fuzzy:{alias}")
+
         return best
 
     def classify_one(self, transaction):

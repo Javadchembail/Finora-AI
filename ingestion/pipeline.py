@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 import pdfplumber
@@ -11,6 +10,7 @@ from ingestion.pdf_reader import PDFReader
 from ingestion.document_detector import DocumentDetector
 from ingestion.universal_structure import UniversalStructureDetector
 from ingestion.universal_row_extractor import UniversalRowExtractor
+from ingestion.ocr_fallback import OCRFallback
 
 from transactions.normalizer import TransactionNormalizer
 from transactions.merchant_normalizer import MerchantNormalizer
@@ -21,6 +21,11 @@ from transactions.models import (
     StatementType,
     TransactionDirection,
     TransactionType,
+)
+
+from learning.category_memory import (
+    CategoryMemory,
+    HybridCategoryEngine,
 )
 
 
@@ -51,18 +56,30 @@ class FinancialStatementPipeline:
         Canonical Transaction
           |
           v
-        Universal Validation
+        Merchant Normalization
           |
           v
-        Merchant Normalization
+        Transaction Type Detection
+          |
+          v
+        Category Intelligence
+          |
+          v
+        Category / Subcategory / Confidence
+          |
+          v
+        Universal Validation
           |
           v
         Validated Transactions
 
-    The pipeline does not contain bank-specific extraction branches.
+    Important:
+        This pipeline is bank-agnostic.
 
-    Federal Bank and Emirates Islamic documents are regression tests,
-    not special cases.
+        Federal Bank, Emirates Islamic, SS1, or any other
+        statement are treated as regression tests only.
+
+        No bank name is used for extraction or categorization.
     """
 
     def __init__(
@@ -70,6 +87,7 @@ class FinancialStatementPipeline:
         file_path: str,
         password: Optional[str] = None,
     ):
+
         self.file_path = file_path
         self.password = password
 
@@ -92,13 +110,26 @@ class FinancialStatementPipeline:
         # Universal structure detector
         # ---------------------------------------------------------
 
-        self.structure_detector = UniversalStructureDetector()
+        self.structure_detector = (
+            UniversalStructureDetector()
+        )
 
         # ---------------------------------------------------------
         # Universal row extractor
         # ---------------------------------------------------------
 
-        self.row_extractor = UniversalRowExtractor()
+        self.row_extractor = (
+            UniversalRowExtractor()
+        )
+
+        # ---------------------------------------------------------
+        # OCR fallback
+        # ---------------------------------------------------------
+
+        self.ocr_fallback = OCRFallback(
+            file_path=file_path,
+            password=password,
+        )
 
         # ---------------------------------------------------------
         # Normalization
@@ -110,23 +141,43 @@ class FinancialStatementPipeline:
         # Merchant normalization
         # ---------------------------------------------------------
 
-        self.merchant_normalizer = MerchantNormalizer()
+        self.merchant_normalizer = (
+            MerchantNormalizer()
+        )
 
         # ---------------------------------------------------------
         # Universal validation
         # ---------------------------------------------------------
 
-        self.validator = UniversalTransactionValidator()
+        self.validator = (
+            UniversalTransactionValidator()
+        )
+
+        # ---------------------------------------------------------
+        # Category memory
+        #
+        # User corrections are persisted here.
+        # ---------------------------------------------------------
+
+        self.category_memory = CategoryMemory()
+
+        # ---------------------------------------------------------
+        # Universal category engine
+        # ---------------------------------------------------------
+
+        self.category_engine = (
+            HybridCategoryEngine(
+                self.category_memory
+            )
+        )
 
     # =============================================================
     # MAIN PIPELINE
     # =============================================================
 
-    def run(self) -> List[Transaction]:
-        """
-        Process the financial document using the universal
-        structure-driven extraction pipeline.
-        """
+    def run(
+        self,
+    ) -> List[Transaction]:
 
         # ---------------------------------------------------------
         # 1. Read document
@@ -141,65 +192,134 @@ class FinancialStatementPipeline:
         # 2. Detect document metadata
         # ---------------------------------------------------------
 
-        metadata = self.detector.detect(pages)
+        metadata = self.detector.detect(
+            pages
+        )
 
         # ---------------------------------------------------------
         # 3. Detect universal transaction structure
         # ---------------------------------------------------------
 
-        structure = self.structure_detector.detect(
-            self.file_path,
-            password=self.password,
+        structure = (
+            self.structure_detector.detect(
+                self.file_path,
+                password=self.password,
+            )
         )
 
-        if not structure.get("detected"):
-            raise ValueError(
-                "Could not detect a financial transaction table "
-                "structure in the document."
-            )
-
-        columns = structure.get("columns", [])
-
-        if not columns:
-            raise ValueError(
-                "Financial transaction columns could not be detected."
-            )
-
-        structure_score = float(
-            structure.get("score", 0.0)
-        )
-
-        print(
-            f"Universal structure detected: "
-            f"page={structure.get('page')}, "
-            f"columns={len(columns)}, "
-            f"score={structure_score:.2f}"
-        )
-
-        for column in columns:
-            print(
-                "  "
-                f"{column.get('header')} "
-                f"-> "
-                f"{column.get('semantic_type')}"
-            )
+        raw_transactions: List[
+            Dict[str, Any]
+        ] = []
 
         # ---------------------------------------------------------
-        # 4. Extract transaction rows from PDF geometry
+        # Normal native-PDF path
         # ---------------------------------------------------------
 
-        raw_transactions = self._extract_universal_rows(
-            columns=columns,
-        )
+        if structure.get("detected"):
+
+            columns = structure.get(
+                "columns",
+                [],
+            )
+
+            if columns:
+
+                structure_score = float(
+                    structure.get(
+                        "score",
+                        0.0,
+                    )
+                )
+
+                print(
+                    f"Universal structure detected: "
+                    f"page={structure.get('page')}, "
+                    f"columns={len(columns)}, "
+                    f"score={structure_score:.2f}"
+                )
+
+                for column in columns:
+
+                    print(
+                        "  "
+                        f"{column.get('header')} "
+                        f"-> "
+                        f"{column.get('semantic_type')}"
+                    )
+
+                # -----------------------------------------------------
+                # 4. Try existing native row extraction first
+                # -----------------------------------------------------
+
+                raw_transactions = (
+                    self._extract_universal_rows(
+                        columns=columns,
+                    )
+                )
+
+                if raw_transactions:
+
+                    print(
+                        f"Universal rows extracted: "
+                        f"{len(raw_transactions)}"
+                    )
+
+        # ---------------------------------------------------------
+        # OCR fallback
+        #
+        # Used when:
+        #   1. structure detection fails, OR
+        #   2. native row extraction returns no rows.
+        #
+        # This keeps normal text-based PDFs on the fast path.
+        # ---------------------------------------------------------
 
         if not raw_transactions:
+
+            print(
+                "Native PDF extraction returned no "
+                "transaction rows."
+            )
+
+            print(
+                "Starting Tesseract OCR fallback..."
+            )
+
+            raw_transactions = (
+                self.ocr_fallback.extract()
+            )
+
+            # Scanned statements may contain currency only inside the
+            # page image, so transfer OCR-detected currency into metadata.
+            ocr_currency = getattr(
+                self.ocr_fallback,
+                "detected_currency",
+                None,
+            )
+
+            if ocr_currency and not getattr(
+                metadata,
+                "currency",
+                None,
+            ):
+                metadata.currency = ocr_currency
+                print(
+                    f"OCR currency detected: {ocr_currency}"
+                )
+
+        # ---------------------------------------------------------
+        # Final extraction check
+        # ---------------------------------------------------------
+
+        if not raw_transactions:
+
             raise ValueError(
-                "No transaction rows could be extracted from the "
-                "detected financial statement structure."
+                "No transaction rows could be extracted "
+                "from the financial statement, including OCR."
             )
 
         print(
-            f"Universal rows extracted: "
+            f"Transactions extracted: "
             f"{len(raw_transactions)}"
         )
 
@@ -214,21 +334,28 @@ class FinancialStatementPipeline:
         )
 
         if statement_year is None:
-            statement_year = self._infer_statement_year(
-                raw_transactions
+
+            statement_year = (
+                self._infer_statement_year(
+                    raw_transactions
+                )
             )
 
         # ---------------------------------------------------------
         # 6. Build canonical transactions
         # ---------------------------------------------------------
 
-        transactions: List[Transaction] = []
+        transactions: List[
+            Transaction
+        ] = []
 
         for index, raw in enumerate(
             raw_transactions,
             start=1,
         ):
+
             try:
+
                 transaction = (
                     self._build_transaction(
                         raw=raw,
@@ -239,16 +366,103 @@ class FinancialStatementPipeline:
                 )
 
                 if transaction is not None:
-                    transactions.append(transaction)
+
+                    transactions.append(
+                        transaction
+                    )
 
             except Exception as exc:
+
                 print(
                     f"WARNING: Could not normalize "
                     f"transaction {index}: {exc}"
                 )
 
         # ---------------------------------------------------------
-        # 7. Universal validation
+        # 7. Category intelligence
+        # ---------------------------------------------------------
+
+        if transactions:
+
+            print(
+                "Starting universal transaction "
+                "categorization..."
+            )
+
+            transactions = (
+                self.category_engine.classify_transactions(
+                    transactions
+                )
+            )
+
+            category_counts: Dict[
+                str,
+                int,
+            ] = {}
+
+            category_review_count = 0
+
+            for transaction in transactions:
+
+                category = (
+                    transaction.category
+                    or "Uncategorized"
+                )
+
+                category_counts[
+                    category
+                ] = (
+                    category_counts.get(
+                        category,
+                        0,
+                    )
+                    + 1
+                )
+
+                if getattr(
+                    transaction,
+                    "requires_review",
+                    False,
+                ):
+
+                    category_review_count += 1
+
+            print(
+                "Category classification completed."
+            )
+
+            print(
+                f"  Categorized transactions: "
+                f"{len(transactions)}"
+            )
+
+            print(
+                f"  Category review transactions: "
+                f"{category_review_count}"
+            )
+
+            print(
+                "  Category distribution:"
+            )
+
+            for (
+                category,
+                count,
+            ) in sorted(
+                category_counts.items(),
+                key=lambda item: (
+                    -item[1],
+                    item[0],
+                ),
+            ):
+
+                print(
+                    f"    {category}: "
+                    f"{count}"
+                )
+
+        # ---------------------------------------------------------
+        # 8. Universal validation
         # ---------------------------------------------------------
 
         validated_transactions = (
@@ -262,6 +476,51 @@ class FinancialStatementPipeline:
             f"{len(validated_transactions)}"
         )
 
+        # ---------------------------------------------------------
+        # 9. Final statistics
+        # ---------------------------------------------------------
+
+        final_category_review = sum(
+            1
+            for transaction
+            in validated_transactions
+            if getattr(
+                transaction,
+                "requires_review",
+                False,
+            )
+        )
+
+        validation_issue_count = sum(
+            1
+            for transaction
+            in validated_transactions
+            if getattr(
+                transaction,
+                "notes",
+                None,
+            )
+        )
+
+        print(
+            "Final pipeline status:"
+        )
+
+        print(
+            f"  Total transactions: "
+            f"{len(validated_transactions)}"
+        )
+
+        print(
+            f"  Category review: "
+            f"{final_category_review}"
+        )
+
+        print(
+            f"  Transactions with validation notes: "
+            f"{validation_issue_count}"
+        )
+
         return validated_transactions
 
     # =============================================================
@@ -272,18 +531,17 @@ class FinancialStatementPipeline:
         self,
         columns: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
+
         """
-        Extract rows from every PDF page using the same semantic
-        structure.
+        Extract rows from every PDF page using the same
+        semantic structure.
 
         No bank name is inspected here.
-
-        The detected semantic column structure is reused across
-        pages because financial statements normally repeat the same
-        transaction table layout throughout the document.
         """
 
-        transactions: List[Dict[str, Any]] = []
+        transactions: List[
+            Dict[str, Any]
+        ] = []
 
         with pdfplumber.open(
             self.file_path,
@@ -294,6 +552,7 @@ class FinancialStatementPipeline:
                 pdf.pages,
                 start=1,
             ):
+
                 words = page.extract_words(
                     use_text_flow=False,
                     keep_blank_chars=False,
@@ -303,26 +562,36 @@ class FinancialStatementPipeline:
                     continue
 
                 try:
+
                     page_transactions = (
                         self.row_extractor.extract(
                             words=words,
                             columns=columns,
                         )
                     )
+
                 except Exception as exc:
+
                     print(
                         f"WARNING: Universal row extraction "
                         f"failed on page {page_number}: {exc}"
                     )
+
                     continue
 
                 for row in page_transactions:
-                    row["page_number"] = page_number
 
-                    # Keep the source file with the raw row.
-                    row["source_file"] = self.file_path
+                    row[
+                        "page_number"
+                    ] = page_number
 
-                    transactions.append(row)
+                    row[
+                        "source_file"
+                    ] = self.file_path
+
+                    transactions.append(
+                        row
+                    )
 
         return transactions
 
@@ -337,40 +606,47 @@ class FinancialStatementPipeline:
         index: int,
         statement_year: Optional[int],
     ) -> Optional[Transaction]:
-        """
-        Convert a universal extracted row into the canonical
-        Transaction model.
-
-        The method works from semantic fields rather than from a
-        specific bank's column layout.
-        """
 
         # ---------------------------------------------------------
         # Date
         # ---------------------------------------------------------
 
-        transaction_date = self._parse_transaction_date(
-            raw.get("transaction_date"),
-            statement_year,
+        transaction_date = (
+            self._parse_transaction_date(
+                raw.get(
+                    "transaction_date"
+                ),
+                statement_year,
+            )
         )
 
-        posting_date = self._parse_transaction_date(
-            raw.get("posting_date"),
-            statement_year,
+        posting_date = (
+            self._parse_transaction_date(
+                raw.get(
+                    "posting_date"
+                ),
+                statement_year,
+            )
         )
 
-        value_date = self._parse_transaction_date(
-            raw.get("value_date"),
-            statement_year,
+        value_date = (
+            self._parse_transaction_date(
+                raw.get(
+                    "value_date"
+                ),
+                statement_year,
+            )
         )
 
         if transaction_date is None:
+
             transaction_date = (
                 posting_date
                 or value_date
             )
 
         if posting_date is None:
+
             posting_date = value_date
 
         if transaction_date is None:
@@ -380,35 +656,52 @@ class FinancialStatementPipeline:
         # Amount
         # ---------------------------------------------------------
 
-        amount, direction_from_amount = (
-            self._extract_amount_and_direction(
-                raw
-            )
+        (
+            amount,
+            direction_from_amount,
+        ) = self._extract_amount_and_direction(
+            raw
         )
 
         if amount is None:
             return None
 
-        amount = abs(amount)
+        amount = abs(
+            amount
+        )
 
         # ---------------------------------------------------------
         # Description
         # ---------------------------------------------------------
 
         description = str(
-            raw.get("description")
+            raw.get(
+                "description"
+            )
             or ""
         ).strip()
 
-        transaction_id = self._clean_optional_text(
-            raw.get("transaction_id")
+        transaction_id = (
+            self._clean_optional_text(
+                raw.get(
+                    "transaction_id"
+                )
+            )
         )
 
-        if not description and not transaction_id:
+        if (
+            not description
+            and not transaction_id
+        ):
+
             return None
 
         if not description:
-            description = transaction_id or "Unknown transaction"
+
+            description = (
+                transaction_id
+                or "Unknown transaction"
+            )
 
         # ---------------------------------------------------------
         # Direction
@@ -426,26 +719,31 @@ class FinancialStatementPipeline:
         # Statement type
         # ---------------------------------------------------------
 
-        statement_type = self._resolve_statement_type(
-            metadata
+        statement_type = (
+            self._resolve_statement_type(
+                metadata
+            )
         )
 
         # ---------------------------------------------------------
         # Currency
         # ---------------------------------------------------------
 
-        currency = self._resolve_currency(
-            metadata
+        currency = (
+            self._resolve_currency(
+                metadata
+            )
         )
 
         # ---------------------------------------------------------
         # Merchant
         # ---------------------------------------------------------
 
-        merchant, merchant_confidence = (
-            self.merchant_normalizer.normalize(
-                description
-            )
+        (
+            merchant,
+            merchant_confidence,
+        ) = self.merchant_normalizer.normalize(
+            description
         )
 
         # ---------------------------------------------------------
@@ -463,26 +761,44 @@ class FinancialStatementPipeline:
         # Statement amount
         # ---------------------------------------------------------
 
-        statement_amount = self._parse_decimal(
-            raw.get("amount")
+        statement_amount = (
+            self._parse_decimal(
+                raw.get(
+                    "amount"
+                )
+            )
         )
 
         if statement_amount is None:
-            statement_amount = self._parse_decimal(
-                raw.get("debit")
+
+            statement_amount = (
+                self._parse_decimal(
+                    raw.get(
+                        "debit"
+                    )
+                )
             )
 
         if statement_amount is None:
-            statement_amount = self._parse_decimal(
-                raw.get("credit")
+
+            statement_amount = (
+                self._parse_decimal(
+                    raw.get(
+                        "credit"
+                    )
+                )
             )
 
         # ---------------------------------------------------------
         # Balance
         # ---------------------------------------------------------
 
-        running_balance = self._parse_decimal(
-            raw.get("balance")
+        running_balance = (
+            self._parse_decimal(
+                raw.get(
+                    "balance"
+                )
+            )
         )
 
         # ---------------------------------------------------------
@@ -491,7 +807,9 @@ class FinancialStatementPipeline:
 
         bank_transaction_id = (
             self._clean_optional_text(
-                raw.get("transaction_id")
+                raw.get(
+                    "transaction_id"
+                )
             )
         )
 
@@ -506,7 +824,7 @@ class FinancialStatementPipeline:
         )
 
         # ---------------------------------------------------------
-        # Confidence
+        # Extraction confidence
         # ---------------------------------------------------------
 
         extraction_confidence = (
@@ -517,46 +835,82 @@ class FinancialStatementPipeline:
         )
 
         return Transaction(
-            transaction_id=f"TXN-{index:06d}",
 
-            transaction_date=transaction_date,
+            transaction_id=(
+                f"TXN-{index:06d}"
+            ),
 
-            posting_date=posting_date,
+            transaction_date=(
+                transaction_date
+            ),
 
-            description_raw=description,
+            posting_date=(
+                posting_date
+            ),
 
-            description_normalized=merchant,
+            description_raw=(
+                description
+            ),
 
-            merchant=merchant,
+            description_normalized=(
+                merchant
+            ),
 
-            original_amount=amount,
+            merchant=(
+                merchant
+            ),
 
-            original_currency=currency,
+            original_amount=(
+                amount
+            ),
+
+            original_currency=(
+                currency
+            ),
 
             statement_amount=(
-                abs(statement_amount)
-                if statement_amount is not None
+                abs(
+                    statement_amount
+                )
+                if statement_amount
+                is not None
                 else amount
             ),
 
-            statement_currency=currency,
+            statement_currency=(
+                currency
+            ),
 
-            direction=direction,
+            direction=(
+                direction
+            ),
 
-            transaction_type=transaction_type,
+            transaction_type=(
+                transaction_type
+            ),
 
-            statement_type=statement_type,
+            statement_type=(
+                statement_type
+            ),
 
-            merchant_confidence=merchant_confidence,
+            merchant_confidence=(
+                merchant_confidence
+            ),
 
-            extraction_confidence=extraction_confidence,
+            extraction_confidence=(
+                extraction_confidence
+            ),
 
             account_identifier=None,
 
-            source_file=self.file_path,
+            source_file=(
+                self.file_path
+            ),
 
             source_page=(
-                raw.get("page_number")
+                raw.get(
+                    "page_number"
+                )
             ),
 
             bank_transaction_id=(
@@ -564,8 +918,11 @@ class FinancialStatementPipeline:
             ),
 
             running_balance=(
-                abs(running_balance)
-                if running_balance is not None
+                abs(
+                    running_balance
+                )
+                if running_balance
+                is not None
                 else None
             ),
 
@@ -584,50 +941,50 @@ class FinancialStatementPipeline:
         self,
         raw: Dict[str, Any],
     ):
-        """
-        Resolve amount and direction from semantic numeric fields.
-
-        Priority:
-
-            debit  -> DEBIT
-            credit -> CREDIT
-            amount -> infer later
-
-        This avoids assuming that every statement has a debit/credit
-        pair.
-        """
 
         debit = self._parse_decimal(
-            raw.get("debit")
+            raw.get(
+                "debit"
+            )
         )
 
         credit = self._parse_decimal(
-            raw.get("credit")
+            raw.get(
+                "credit"
+            )
         )
 
         amount = self._parse_decimal(
-            raw.get("amount")
+            raw.get(
+                "amount"
+            )
         )
 
         if debit is not None:
+
             return (
                 abs(debit),
                 TransactionDirection.DEBIT,
             )
 
         if credit is not None:
+
             return (
                 abs(credit),
                 TransactionDirection.CREDIT,
             )
 
         if amount is not None:
+
             return (
                 abs(amount),
                 None,
             )
 
-        return None, None
+        return (
+            None,
+            None,
+        )
 
     # =============================================================
     # DIRECTION
@@ -638,22 +995,13 @@ class FinancialStatementPipeline:
         raw: Dict[str, Any],
         metadata: Any,
     ) -> TransactionDirection:
-        """
-        Infer direction when the document exposes only a generic
-        amount column.
-
-        The inference is semantic and document-driven. It does not
-        inspect a bank name.
-        """
 
         description = str(
-            raw.get("description")
+            raw.get(
+                "description"
+            )
             or ""
         ).upper()
-
-        # ---------------------------------------------------------
-        # Explicit textual credit indicators
-        # ---------------------------------------------------------
 
         credit_terms = (
             "CREDIT",
@@ -670,12 +1018,12 @@ class FinancialStatementPipeline:
         )
 
         for term in credit_terms:
-            if term in description:
-                return TransactionDirection.CREDIT
 
-        # ---------------------------------------------------------
-        # Explicit textual debit indicators
-        # ---------------------------------------------------------
+            if term in description:
+
+                return (
+                    TransactionDirection.CREDIT
+                )
 
         debit_terms = (
             "DEBIT",
@@ -690,25 +1038,31 @@ class FinancialStatementPipeline:
         )
 
         for term in debit_terms:
+
             if term in description:
-                return TransactionDirection.DEBIT
 
-        # ---------------------------------------------------------
-        # Statement-level fallback
-        # ---------------------------------------------------------
+                return (
+                    TransactionDirection.DEBIT
+                )
 
-        statement_type = self._resolve_statement_type(
-            metadata
+        statement_type = (
+            self._resolve_statement_type(
+                metadata
+            )
         )
 
-        if statement_type == StatementType.CREDIT_CARD:
-            return TransactionDirection.DEBIT
+        if (
+            statement_type
+            == StatementType.CREDIT_CARD
+        ):
 
-        # Generic financial statements normally represent a
-        # transaction amount as an outgoing amount when no explicit
-        # direction is available. Validation can flag ambiguous
-        # cases later.
-        return TransactionDirection.DEBIT
+            return (
+                TransactionDirection.DEBIT
+            )
+
+        return (
+            TransactionDirection.DEBIT
+        )
 
     # =============================================================
     # STATEMENT TYPE
@@ -718,6 +1072,7 @@ class FinancialStatementPipeline:
         self,
         metadata: Any,
     ) -> StatementType:
+
         value = getattr(
             metadata,
             "statement_type",
@@ -728,13 +1083,17 @@ class FinancialStatementPipeline:
             value,
             StatementType,
         ):
+
             return value
 
         if value:
+
             try:
+
                 return StatementType(
                     str(value)
                 )
+
             except ValueError:
                 pass
 
@@ -748,6 +1107,7 @@ class FinancialStatementPipeline:
         self,
         metadata: Any,
     ) -> str:
+
         currency = getattr(
             metadata,
             "currency",
@@ -755,6 +1115,7 @@ class FinancialStatementPipeline:
         )
 
         if currency:
+
             return str(
                 currency
             ).upper()
@@ -770,14 +1131,16 @@ class FinancialStatementPipeline:
         description: str,
         direction: TransactionDirection,
     ) -> TransactionType:
-        """
-        Generic semantic transaction classification.
 
-        These rules are intentionally based on transaction meaning,
-        not bank identity.
-        """
+        text = " ".join(
+            str(
+                description or ""
+            ).upper().split()
+        )
 
-        text = description.upper()
+        # ---------------------------------------------------------
+        # Salary
+        # ---------------------------------------------------------
 
         if any(
             term in text
@@ -785,9 +1148,19 @@ class FinancialStatementPipeline:
                 "SALARY",
                 "PAYROLL",
                 "WAGES",
+                "MONTHLY SALARY",
+                "SALARY CREDIT",
+                "SALARY CR",
+                "PAYROLL CREDIT",
+                "EMPLOYEE SALARY",
             )
         ):
+
             return TransactionType.SALARY
+
+        # ---------------------------------------------------------
+        # Refund / reversal
+        # ---------------------------------------------------------
 
         if any(
             term in text
@@ -795,57 +1168,93 @@ class FinancialStatementPipeline:
                 "REFUND",
                 "REVERSAL",
                 "REVERSED",
+                "REVERTED",
+                "CHARGEBACK",
+                "RETURNED PAYMENT",
+                "PAYMENT RETURN",
+                "CREDIT REVERSAL",
             )
         ):
+
             return TransactionType.REFUND
+
+        # ---------------------------------------------------------
+        # Interest
+        # ---------------------------------------------------------
 
         if any(
             term in text
             for term in (
                 "INTEREST",
                 "INT CREDIT",
+                "INT CR",
                 "INT PAID",
+                "INTEREST CREDIT",
+                "INTEREST DEBIT",
+                "INTEREST PAYMENT",
             )
         ):
+
             return TransactionType.INTEREST
+
+        # ---------------------------------------------------------
+        # Fees
+        # ---------------------------------------------------------
 
         if any(
             term in text
             for term in (
                 "FEE",
-                "CHARGE",
+                "FEES",
                 "SERVICE CHARGE",
                 "BANK CHARGE",
+                "PROCESSING CHARGE",
+                "PROCESSING FEE",
+                "CONVENIENCE FEE",
+                "TRANSACTION FEE",
+                "ANNUAL FEE",
+                "MAINTENANCE FEE",
+                "ATM FEE",
+                "CARD FEE",
+                "LATE FEE",
             )
         ):
+
             return TransactionType.FEE
 
-        if any(
-            term in text
-            for term in (
-                "TRANSFER",
-                "TRF",
-                "WIRE",
-                "ACH",
-                "SEPA",
-                "SWIFT",
-                "UPI",
-                "IMPS",
-                "NEFT",
-                "RTGS",
-            )
+        if (
+            text.startswith("CHARGE ")
+            or text.endswith(" CHARGE")
         ):
-            return TransactionType.TRANSFER
+
+            return TransactionType.FEE
+
+        # ---------------------------------------------------------
+        # Cash withdrawal
+        # ---------------------------------------------------------
 
         if any(
             term in text
             for term in (
-                "ATM",
+                "ATM WITHDRAWAL",
+                "ATM CASH",
+                "ATM WDL",
+                "ATM WD",
                 "CASH WITHDRAWAL",
                 "CASH WITHDRAW",
+                "CASH WDL",
+                "CASH WD",
+                "CASH DISPENSE",
             )
-        ):
-            return TransactionType.CASH_WITHDRAWAL
+        ) or text.startswith("ATM"):
+
+            return (
+                TransactionType.CASH_WITHDRAWAL
+            )
+
+        # ---------------------------------------------------------
+        # Loan
+        # ---------------------------------------------------------
 
         if any(
             term in text
@@ -853,34 +1262,230 @@ class FinancialStatementPipeline:
                 "LOAN",
                 "EMI",
                 "INSTALLMENT",
+                "INSTALMENT",
+                "LOAN REPAYMENT",
+                "LOAN PAYMENT",
+                "FINANCE PAYMENT",
+                "MORTGAGE PAYMENT",
             )
         ):
-            return TransactionType.LOAN_PAYMENT
+
+            return (
+                TransactionType.LOAN_PAYMENT
+            )
+
+        # ---------------------------------------------------------
+        # Tax
+        # ---------------------------------------------------------
 
         if any(
             term in text
             for term in (
-                "BILL",
-                "UTILITY",
-                "ELECTRICITY",
-                "WATER",
-                "INTERNET",
-                "TELECOM",
-            )
-        ):
-            return TransactionType.BILL_PAYMENT
-
-        if any(
-            term in text
-            for term in (
-                "TAX",
-                "GOVERNMENT",
+                "INCOME TAX",
+                "PROPERTY TAX",
+                "SALES TAX",
+                "GST",
                 "VAT",
+                "TAX PAYMENT",
+                "TAX PAID",
+                "GOVERNMENT FEE",
+                "GOVERNMENT PAYMENT",
+                "MUNICIPAL TAX",
+                "CUSTOMS DUTY",
+                "DUTY PAYMENT",
             )
         ):
+
             return TransactionType.TAX
 
-        if direction == TransactionDirection.CREDIT:
+        if (
+            text == "TAX"
+            or text.startswith("TAX ")
+            or text.startswith("GOVERNMENT ")
+        ):
+
+            return TransactionType.TAX
+
+        # ---------------------------------------------------------
+        # Bills
+        # ---------------------------------------------------------
+
+        if any(
+            term in text
+            for term in (
+                "BILL PAYMENT",
+                "BILL PAY",
+                "UTILITY PAYMENT",
+                "ELECTRICITY",
+                "ELECTRIC BILL",
+                "WATER BILL",
+                "GAS BILL",
+                "GAS PAYMENT",
+                "INTERNET BILL",
+                "INTERNET PAYMENT",
+                "BROADBAND",
+                "TELECOM BILL",
+                "TELECOM PAYMENT",
+                "MOBILE BILL",
+                "MOBILE PAYMENT",
+                "PHONE BILL",
+                "PHONE PAYMENT",
+                "UTILITY",
+            )
+        ):
+
+            return (
+                TransactionType.BILL_PAYMENT
+            )
+
+        # ---------------------------------------------------------
+        # Investments
+        # ---------------------------------------------------------
+
+        if any(
+            term in text
+            for term in (
+                "STOCK PURCHASE",
+                "BUY STOCK",
+                "SHARE PURCHASE",
+                "BUY SHARES",
+                "MUTUAL FUND",
+                "MUTUAL FUNDS",
+                "SYSTEMATIC INVESTMENT",
+                "SIP",
+                "BOND PURCHASE",
+                "BROKERAGE",
+                "BROKER",
+                "SECURITIES",
+                "INVESTMENT",
+                "INVESTMENTS",
+                "DEMAT",
+            )
+        ):
+
+            return (
+                TransactionType.INVESTMENT
+            )
+
+        # ---------------------------------------------------------
+        # Card payments
+        # ---------------------------------------------------------
+
+        if any(
+            term in text
+            for term in (
+                "CREDIT CARD PAYMENT",
+                "CARD PAYMENT",
+                "CARD BILL PAYMENT",
+                "CREDIT CARD BILL",
+                "CARD BILL",
+                "CARD SETTLEMENT",
+                "PAYMENT RECEIVED",
+                "PAYMENT RECEIVED FROM",
+            )
+        ):
+
+            return (
+                TransactionType.PAYMENT
+            )
+
+        # ---------------------------------------------------------
+        # Explicit transfers
+        # ---------------------------------------------------------
+
+        explicit_transfer_terms = (
+            "TRANSFER",
+            "TRANSFER TO",
+            "TRANSFER FROM",
+            "BANK TRANSFER",
+            "INTERNAL TRANSFER",
+            "SELF TRANSFER",
+            "OWN ACCOUNT",
+            "OWN A/C",
+            "BETWEEN ACCOUNTS",
+            "BENEFICIARY",
+            "P2P TRANSFER",
+            "PERSON TO PERSON",
+            "ACCOUNT TRANSFER",
+            "TRF TO",
+            "TRF FROM",
+            "TRANSFER CR",
+            "TRANSFER DR",
+            "WIRE TRANSFER",
+            "WIRE PAYMENT",
+            "SWIFT TRANSFER",
+            "SEPA TRANSFER",
+            "ACH TRANSFER",
+            "DIRECT DEBIT",
+        )
+
+        if any(
+            term in text
+            for term in explicit_transfer_terms
+        ):
+
+            return (
+                TransactionType.TRANSFER
+            )
+
+        tokens = set(
+            text
+            .replace("/", " ")
+            .replace("-", " ")
+            .split()
+        )
+
+        if tokens.intersection(
+            {
+                "TRF",
+                "XFER",
+                "TRANSFER",
+            }
+        ):
+
+            return (
+                TransactionType.TRANSFER
+            )
+
+        # ---------------------------------------------------------
+        # Payment rail context
+        # ---------------------------------------------------------
+
+        rails = {
+            "UPI",
+            "IMPS",
+            "NEFT",
+            "RTGS",
+            "ACH",
+            "SEPA",
+            "SWIFT",
+        }
+
+        has_rail = bool(
+            tokens.intersection(
+                rails
+            )
+        )
+
+        if (
+            has_rail
+            and direction
+            == TransactionDirection.CREDIT
+        ):
+
+            return (
+                TransactionType.TRANSFER
+            )
+
+        # ---------------------------------------------------------
+        # Generic fallback
+        # ---------------------------------------------------------
+
+        if (
+            direction
+            == TransactionDirection.CREDIT
+        ):
+
             return TransactionType.OTHER
 
         return TransactionType.PURCHASE
@@ -893,12 +1498,6 @@ class FinancialStatementPipeline:
         self,
         description: str,
     ) -> Optional[str]:
-        """
-        Infer a generic payment channel from transaction text.
-
-        This is enrichment only. It is not used to extract the
-        transaction itself.
-        """
 
         text = description.upper()
 
@@ -917,8 +1516,13 @@ class FinancialStatementPipeline:
             ("ONLINE", "ONLINE"),
         )
 
-        for marker, channel in channel_patterns:
+        for (
+            marker,
+            channel,
+        ) in channel_patterns:
+
             if marker in text:
+
                 return channel
 
         return None
@@ -936,32 +1540,44 @@ class FinancialStatementPipeline:
         if value is None:
             return None
 
-        text = str(value).strip()
+        text = str(
+            value
+        ).strip()
 
         if not text:
             return None
 
         try:
-            result = self.normalizer.parse_date(
-                text,
-                year=statement_year,
+
+            result = (
+                self.normalizer.parse_date(
+                    text,
+                    year=statement_year,
+                )
             )
 
-            if isinstance(result, date):
+            if isinstance(
+                result,
+                date,
+            ):
+
                 return result
 
             return result
 
         except Exception:
+
             return None
 
     # =============================================================
-    # STATEMENT YEAR INFERENCE
+    # STATEMENT YEAR
     # =============================================================
 
     def _infer_statement_year(
         self,
-        rows: List[Dict[str, Any]],
+        rows: List[
+            Dict[str, Any]
+        ],
     ) -> Optional[int]:
 
         for row in rows:
@@ -971,43 +1587,52 @@ class FinancialStatementPipeline:
                 "posting_date",
                 "value_date",
             ):
-                value = row.get(field)
+
+                value = row.get(
+                    field
+                )
 
                 if not value:
                     continue
 
-                text = str(value)
+                text = str(
+                    value
+                )
 
-                # YYYY-MM-DD
-                parts = text.split("-")
+                parts = text.split(
+                    "-"
+                )
 
                 if (
                     len(parts) == 3
                     and len(parts[0]) == 4
                     and parts[0].isdigit()
                 ):
+
                     return int(
                         parts[0]
                     )
 
-                # DD-MMM-YYYY
                 if (
                     len(parts) == 3
                     and parts[-1].isdigit()
                     and len(parts[-1]) == 4
                 ):
+
                     return int(
                         parts[-1]
                     )
 
-                # DD/MM/YYYY
-                parts = text.split("/")
+                parts = text.split(
+                    "/"
+                )
 
                 if (
                     len(parts) == 3
                     and parts[-1].isdigit()
                     and len(parts[-1]) == 4
                 ):
+
                     return int(
                         parts[-1]
                     )
@@ -1030,18 +1655,28 @@ class FinancialStatementPipeline:
             value,
             Decimal,
         ):
+
             return value
 
-        text = str(value).strip()
+        text = str(
+            value
+        ).strip()
 
         if not text:
             return None
 
         negative = False
 
-        if text.startswith("(") and text.endswith(")"):
+        if (
+            text.startswith("(")
+            and text.endswith(")")
+        ):
+
             negative = True
-            text = text[1:-1]
+
+            text = text[
+                1:-1
+            ]
 
         text = (
             text
@@ -1057,23 +1692,37 @@ class FinancialStatementPipeline:
             .strip()
         )
 
-        # Handle common trailing credit/debit markers.
         upper = text.upper()
 
-        if upper.endswith("CR"):
-            text = text[:-2].strip()
+        if upper.endswith(
+            "CR"
+        ):
 
-        elif upper.endswith("DR"):
+            text = text[
+                :-2
+            ].strip()
+
+        elif upper.endswith(
+            "DR"
+        ):
+
             negative = True
-            text = text[:-2].strip()
+
+            text = text[
+                :-2
+            ].strip()
 
         try:
+
             number = Decimal(
                 text
             )
 
             if negative:
-                number = -abs(number)
+
+                number = -abs(
+                    number
+                )
 
             return number
 
@@ -1081,6 +1730,7 @@ class FinancialStatementPipeline:
             InvalidOperation,
             ValueError,
         ):
+
             return None
 
     # =============================================================
@@ -1095,9 +1745,14 @@ class FinancialStatementPipeline:
         if value is None:
             return None
 
-        text = str(value).strip()
+        text = str(
+            value
+        ).strip()
 
-        return text or None
+        return (
+            text
+            or None
+        )
 
     # =============================================================
     # EXTRACTION CONFIDENCE
@@ -1108,50 +1763,72 @@ class FinancialStatementPipeline:
         raw: Dict[str, Any],
         structure_confidence: Optional[float],
     ) -> float:
-        """
-        Estimate confidence from the fields actually recovered.
-
-        This is intentionally conservative and independent of bank
-        identity.
-        """
 
         score = 0.50
 
-        if raw.get("transaction_date"):
+        if raw.get(
+            "transaction_date"
+        ):
+
             score += 0.10
 
-        if raw.get("posting_date"):
+        if raw.get(
+            "posting_date"
+        ):
+
             score += 0.05
 
-        if raw.get("value_date"):
+        if raw.get(
+            "value_date"
+        ):
+
             score += 0.05
 
-        if raw.get("description"):
+        if raw.get(
+            "description"
+        ):
+
             score += 0.10
 
-        if raw.get("amount"):
+        if raw.get(
+            "amount"
+        ):
+
             score += 0.10
 
         if (
             raw.get("debit")
             or raw.get("credit")
         ):
+
             score += 0.10
 
-        if raw.get("transaction_id"):
+        if raw.get(
+            "transaction_id"
+        ):
+
             score += 0.05
 
-        if raw.get("balance"):
+        if raw.get(
+            "balance"
+        ):
+
             score += 0.05
 
         if structure_confidence is not None:
+
             score = (
                 score * 0.70
-                + float(structure_confidence) * 0.30
+                + float(
+                    structure_confidence
+                ) * 0.30
             )
 
         return min(
-            round(score, 4),
+            round(
+                score,
+                4,
+            ),
             1.0,
         )
 
@@ -1161,21 +1838,20 @@ class FinancialStatementPipeline:
 
     def _validate_transactions(
         self,
-        transactions: List[Transaction],
-    ) -> List[Transaction]:
-        """
-        Validate all canonical transactions.
-
-        Validation is performed after universal extraction so the
-        validator remains completely independent of document layout
-        or bank identity.
-        """
+        transactions: List[
+            Transaction
+        ],
+    ) -> List[
+        Transaction
+    ]:
 
         validated_transactions: List[
             Transaction
         ] = []
 
-        seen_transaction_keys: Set[str] = set()
+        seen_transaction_keys: Set[
+            str
+        ] = set()
 
         previous_transaction: Optional[
             Transaction
@@ -1183,12 +1859,28 @@ class FinancialStatementPipeline:
 
         for transaction in transactions:
 
-            result = self.validator.validate(
-                transaction=transaction,
-                previous_transaction=previous_transaction,
-                seen_transaction_keys=(
-                    seen_transaction_keys
-                ),
+            # Save the category-review state BEFORE validation.
+            #
+            # Validation should not destroy category intelligence.
+
+            category_requires_review = (
+                getattr(
+                    transaction,
+                    "requires_review",
+                    False,
+                )
+            )
+
+            result = (
+                self.validator.validate(
+                    transaction=transaction,
+                    previous_transaction=(
+                        previous_transaction
+                    ),
+                    seen_transaction_keys=(
+                        seen_transaction_keys
+                    ),
+                )
             )
 
             # -----------------------------------------------------
@@ -1197,14 +1889,6 @@ class FinancialStatementPipeline:
 
             transaction.extraction_confidence = (
                 result.confidence
-            )
-
-            # -----------------------------------------------------
-            # Manual review
-            # -----------------------------------------------------
-
-            transaction.requires_review = (
-                result.requires_review
             )
 
             # -----------------------------------------------------
@@ -1227,6 +1911,27 @@ class FinancialStatementPipeline:
                         issue_messages
                     )
                 )
+
+            # -----------------------------------------------------
+            # CATEGORY REVIEW
+            #
+            # IMPORTANT:
+            #
+            # The validator's requires_review flag is NOT merged
+            # into the category review flag.
+            #
+            # This keeps:
+            #
+            #   category confidence
+            #
+            # separate from:
+            #
+            #   extraction / validation confidence.
+            # -----------------------------------------------------
+
+            transaction.requires_review = (
+                category_requires_review
+            )
 
             # -----------------------------------------------------
             # Keep transaction
@@ -1254,6 +1959,8 @@ class FinancialStatementPipeline:
             # Previous transaction
             # -----------------------------------------------------
 
-            previous_transaction = transaction
+            previous_transaction = (
+                transaction
+            )
 
         return validated_transactions

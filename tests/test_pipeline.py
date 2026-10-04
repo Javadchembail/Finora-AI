@@ -1,11 +1,22 @@
 from ingestion.pipeline import FinancialStatementPipeline
 
 
-PDF_PATH = "storage/sample_statement.pdf"
+# =========================================================
+# PDF CONFIGURATION
+# =========================================================
 
+PDF_PATH = "storage/federal_statement.pdf"
+
+PASSWORD = input("Enter PDF password: ").strip()
+
+
+# =========================================================
+# RUN FINORA PIPELINE
+# =========================================================
 
 pipeline = FinancialStatementPipeline(
-    PDF_PATH
+    PDF_PATH,
+    password=PASSWORD
 )
 
 transactions = pipeline.run()

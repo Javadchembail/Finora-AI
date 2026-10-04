@@ -1,10 +1,48 @@
+# Virtual environment
 .venv/
-__pycache__/
-*.pyc
+venv/
+env/
+
+# Environment / secrets
 .env
-*.db
-*.sqlite
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local application data
 storage/
 uploads/
 exports/
-.streamlit/secrets.toml
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Generated/debug files
+*.log
+pipeline_output.txt
+
+# Backup / broken source files
+*.backup
+*.backup.py
+*.broken.py
+
+# Local test/sample files
+inspect_sample.py
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Local PDFs / documents
+*.pdf
