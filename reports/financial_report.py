@@ -2,15 +2,19 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from decimal import Decimal
+from datetime import timedelta
 from html import escape
 from io import BytesIO
 from typing import Iterable
 
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_LEFT, TA_RIGHT
+from reportlab.lib.enums import TA_LEFT, TA_RIGHT, TA_CENTER
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
 from reportlab.platypus import (
     BaseDocTemplate,
     Flowable,
@@ -18,6 +22,7 @@ from reportlab.platypus import (
     KeepTogether,
     PageBreak,
     PageTemplate,
+    SimpleDocTemplate,
     Paragraph,
     Spacer,
     Table,
@@ -25,7 +30,7 @@ from reportlab.platypus import (
 )
 
 
-PAGE_SIZE = landscape(A4)
+PAGE_SIZE = A4
 PAGE_W, PAGE_H = PAGE_SIZE
 
 # Existing Finora palette - preserved.
@@ -41,13 +46,22 @@ GREEN = colors.HexColor("#16834A")
 RED = colors.HexColor("#C43A3A")
 AMBER = colors.HexColor("#A85C00")
 
+# Emoji font used by the category-spending visual. TwemojiMozilla is embedded
+# when available so category pictograms survive PDF export.
+try:
+    _TWEMOJI_FONT_PATH = "/usr/share/texlive/texmf-dist/fonts/truetype/public/twemoji-colr/TwemojiMozilla.ttf"
+    pdfmetrics.registerFont(TTFont("Twemoji", _TWEMOJI_FONT_PATH))
+    TWEMOJI_FONT = "Twemoji"
+except Exception:
+    TWEMOJI_FONT = "Helvetica"
+
 
 class FinoraBarChart(Flowable):
     """Small horizontal bar chart using the existing report palette."""
 
     def __init__(self, rows, width=240 * mm, bar_height=6, row_gap=7):
         super().__init__()
-        self.rows = rows[:8]
+        self.rows = rows
         self.width = width
         self.bar_height = bar_height
         self.row_gap = row_gap
@@ -534,548 +548,684 @@ def _repeated_merchants(txs: list):
     ][:8]
 
 
-def _build_report(
-    transactions,
-    file_name: str | None = None,
-    statement_metadata: dict | None = None,
-):
+class Concept3SpendingDonut(Flowable):
+    """Premium spending-allocation donut used by the final Finora report."""
+    def __init__(self, data, width=174 * mm, height=78 * mm):
+        super().__init__()
+        self.data = data
+        self.width = width
+        self.height = height
+
+    def wrap(self, availWidth, availHeight):
+        return min(self.width, availWidth), self.height
+
+    def draw(self):
+        if not self.data:
+            return
+        c = self.canv
+        cx, cy = 48 * mm, self.height / 2
+        r, inner = 25 * mm, 15.5 * mm
+        palette = [
+            colors.HexColor("#7C5CFC"), colors.HexColor("#4F7CFF"),
+            colors.HexColor("#19B5A5"), colors.HexColor("#F59E0B"),
+            colors.HexColor("#EF5B5B"), colors.HexColor("#8B5CF6"),
+            colors.HexColor("#14B8A6"), colors.HexColor("#64748B"),
+            colors.HexColor("#F97316"), colors.HexColor("#94A3B8"),
+        ]
+        total = sum(v for _, v, _ in self.data) or 1.0
+        start = 90
+        for i, (_, value, _) in enumerate(self.data):
+            extent = 360 * value / total
+            c.setFillColor(palette[i % len(palette)])
+            c.wedge(cx-r, cy-r, cx+r, cy+r, start-extent, start, fill=1, stroke=0)
+            start -= extent
+        c.setFillColor(colors.HexColor("#F5F6FA"))
+        c.circle(cx, cy, inner, fill=1, stroke=0)
+        c.setFillColor(colors.HexColor("#0B1220"))
+        c.setFont("Helvetica-Bold", 11)
+        c.drawCentredString(cx, cy + 2.2 * mm, "SPENDING")
+        c.setFillColor(colors.HexColor("#667085"))
+        c.setFont("Helvetica", 6.2)
+        c.drawCentredString(cx, cy - 3.7 * mm, "TOTAL SPENDING")
+
+        lx, ly = 88 * mm, self.height - 5 * mm
+        for i, (label, value, pct) in enumerate(self.data):
+            col = palette[i % len(palette)]
+            c.setFillColor(col)
+            c.roundRect(lx, ly - 1.2 * mm, 3.1 * mm, 3.1 * mm, 0.7, fill=1, stroke=0)
+            c.setFillColor(colors.HexColor("#172033"))
+            c.setFont("Helvetica-Bold", 6.7)
+            c.drawString(lx + 5 * mm, ly, str(label)[:28])
+            c.setFillColor(colors.HexColor("#667085"))
+            c.setFont("Helvetica", 6.5)
+            c.drawRightString(self.width, ly, f"{pct:.1f}% · {value:,.2f}")
+            ly -= 6.6 * mm
+
+
+class Concept3BehaviourDiagram(Flowable):
+    """Value-vs-frequency map: a genuinely different view of category behaviour."""
+    def __init__(self, data, width=174 * mm, height=88 * mm):
+        super().__init__()
+        self.data = data
+        self.width = width
+        self.height = height
+
+    def wrap(self, availWidth, availHeight):
+        return min(self.width, availWidth), self.height
+
+    def draw(self):
+        if not self.data:
+            return
+        c = self.canv
+        x0, y0, w, h = 22 * mm, 17 * mm, 145 * mm, 55 * mm
+        c.setStrokeColor(colors.HexColor("#E3E7EF"))
+        c.setLineWidth(0.8)
+        c.line(x0, y0, x0+w, y0)
+        c.line(x0, y0, x0, y0+h)
+        c.setFillColor(colors.HexColor("#667085"))
+        c.setFont("Helvetica", 6.5)
+        c.drawString(x0+w-40*mm, y0-6*mm, "TRANSACTION FREQUENCY →")
+        c.saveState()
+        c.translate(x0-9*mm, y0+24*mm)
+        c.rotate(90)
+        c.drawString(0, 0, "SPEND VALUE →")
+        c.restoreState()
+
+        max_value = max(v for _, v, _ in self.data) or 1.0
+        max_count = max(n for _, _, n in self.data) or 1
+        palette = [
+            colors.HexColor("#7C5CFC"), colors.HexColor("#4F7CFF"),
+            colors.HexColor("#19B5A5"), colors.HexColor("#F59E0B"),
+            colors.HexColor("#EF5B5B"), colors.HexColor("#8B5CF6"),
+            colors.HexColor("#14B8A6"), colors.HexColor("#64748B"),
+            colors.HexColor("#F97316"), colors.HexColor("#94A3B8"),
+        ]
+        for i, (label, value, count) in enumerate(self.data):
+            x = x0 + (count / max_count) * (w - 9*mm) + 4*mm
+            y = y0 + (value / max_value) * (h - 7*mm) + 3*mm
+            radius = 3.5*mm if value > max_value * 0.15 else 2.4*mm
+            c.setFillColor(palette[i % len(palette)])
+            c.circle(x, y, radius, fill=1, stroke=0)
+            c.setFillColor(colors.HexColor("#172033"))
+            c.setFont("Helvetica-Bold", 5.9)
+            c.drawCentredString(x, min(y + radius + 1.7*mm, y0+h+3*mm), str(label)[:16])
+
+
+class Concept3WeeklyChart(Flowable):
+    """Weekly spending vs payments/credits chart."""
+    def __init__(self, series, width=174 * mm, height=67 * mm):
+        super().__init__()
+        self.series = series
+        self.width = width
+        self.height = height
+
+    def wrap(self, availWidth, availHeight):
+        return min(self.width, availWidth), self.height
+
+    def draw(self):
+        if not self.series:
+            return
+        c = self.canv
+        left, bottom = 17*mm, 14*mm
+        chart_w, chart_h = self.width-24*mm, 42*mm
+        max_value = max(max((x[1] for x in self.series), default=0), max((x[2] for x in self.series), default=0), 1)
+        for fraction in (0, .5, 1):
+            y = bottom + chart_h*fraction
+            c.setStrokeColor(colors.HexColor("#E3E7EF"))
+            c.line(left, y, left+chart_w, y)
+        slot = chart_w / max(1, len(self.series))
+        bw = min(9*mm, slot*0.22)
+        for i, (label, spent, payments) in enumerate(self.series):
+            x = left + i*slot + slot*0.34
+            c.setFillColor(colors.HexColor("#EF5B5B"))
+            c.roundRect(x, bottom, bw, chart_h*spent/max_value, 1.5, fill=1, stroke=0)
+            c.setFillColor(colors.HexColor("#22C55E"))
+            c.roundRect(x+bw+1.5, bottom, bw, chart_h*payments/max_value, 1.5, fill=1, stroke=0)
+            c.setFillColor(colors.HexColor("#667085"))
+            c.setFont("Helvetica", 6)
+            c.drawCentredString(x+bw, bottom-5.5*mm, str(label)[:8])
+        c.setFillColor(colors.HexColor("#EF5B5B")); c.rect(2*mm, self.height-4*mm, 5*mm, 2*mm, fill=1, stroke=0)
+        c.setFillColor(colors.HexColor("#667085")); c.setFont("Helvetica", 6.5); c.drawString(9*mm, self.height-4.5*mm, "Spending")
+        c.setFillColor(colors.HexColor("#22C55E")); c.rect(33*mm, self.height-4*mm, 5*mm, 2*mm, fill=1, stroke=0)
+        c.setFillColor(colors.HexColor("#667085")); c.drawString(40*mm, self.height-4.5*mm, "Payments / credits")
+
+
+def _concept3_styles():
+    base = getSampleStyleSheet()
+    return {
+        "title": ParagraphStyle("C3Title", parent=base["Title"], fontName="Helvetica-Bold", fontSize=27, leading=31, textColor=colors.white),
+        "heading": ParagraphStyle("C3Heading", parent=base["Heading2"], fontName="Helvetica-Bold", fontSize=19, leading=23, textColor=colors.HexColor("#0B1220")),
+        "h2": ParagraphStyle("C3H2", parent=base["Heading3"], fontName="Helvetica-Bold", fontSize=10.5, leading=13, textColor=colors.HexColor("#172033")),
+        "body": ParagraphStyle("C3Body", parent=base["Normal"], fontName="Helvetica", fontSize=8.5, leading=12, textColor=colors.HexColor("#172033")),
+        "small": ParagraphStyle("C3Small", parent=base["Normal"], fontName="Helvetica", fontSize=7.1, leading=9.2, textColor=colors.HexColor("#667085")),
+        "metric_label": ParagraphStyle("C3MetricLabel", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=6.2, leading=7.5, textColor=colors.HexColor("#667085")),
+        "metric": ParagraphStyle("C3Metric", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=15, leading=17, textColor=colors.HexColor("#0B1220")),
+        "white": ParagraphStyle("C3White", parent=base["Normal"], fontName="Helvetica", fontSize=8.5, leading=12, textColor=colors.HexColor("#CBD5E1")),
+        "table_head": ParagraphStyle("C3TableHead", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=6.1, leading=7.3, textColor=colors.white),
+        "table": ParagraphStyle("C3Table", parent=base["Normal"], fontName="Helvetica", fontSize=6.2, leading=7.7, textColor=colors.HexColor("#172033")),
+        "table_right": ParagraphStyle("C3TableRight", parent=base["Normal"], fontName="Helvetica", fontSize=6.2, leading=7.7, textColor=colors.HexColor("#172033"), alignment=TA_RIGHT),
+    }
+
+
+def _c3_card(title, value, note, accent, styles, width=53*mm):
+    t = Table([
+        [Paragraph(title.upper(), styles["metric_label"])],
+        [Paragraph(value, styles["metric"])],
+        [Paragraph(note, styles["small"])],
+    ], colWidths=[width])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), colors.white),
+        ("BOX", (0,0), (-1,-1), .55, colors.HexColor("#E3E7EF")),
+        ("LINEBEFORE", (0,0), (0,-1), 3, accent),
+        ("LEFTPADDING", (0,0), (-1,-1), 8), ("RIGHTPADDING", (0,0), (-1,-1), 6),
+        ("TOPPADDING", (0,0), (-1,-1), 6), ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+    ]))
+    return t
+
+
+def _c3_box(content, widths, styles, background=None, padding=7):
+    t = Table(content, colWidths=widths, hAlign="LEFT")
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), background or colors.white),
+        ("BOX", (0,0), (-1,-1), .55, colors.HexColor("#E3E7EF")),
+        ("INNERGRID", (0,0), (-1,-1), .35, colors.HexColor("#E3E7EF")),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("LEFTPADDING", (0,0), (-1,-1), padding), ("RIGHTPADDING", (0,0), (-1,-1), padding),
+        ("TOPPADDING", (0,0), (-1,-1), padding), ("BOTTOMPADDING", (0,0), (-1,-1), padding),
+    ]))
+    return t
+
+
+def _c3_chrome(canvas, doc):
+    canvas.saveState()
+    if doc.page > 1:
+        canvas.setFillColor(colors.HexColor("#F5F6FA"))
+        canvas.rect(0,0,PAGE_W,PAGE_H,fill=1,stroke=0)
+        canvas.setFillColor(colors.HexColor("#7C5CFC"))
+        canvas.rect(0,PAGE_H-3*mm,PAGE_W,3*mm,fill=1,stroke=0)
+        canvas.setFillColor(colors.HexColor("#0B1220")); canvas.setFont("Helvetica-Bold",7.5)
+        canvas.drawString(18*mm,PAGE_H-11*mm,"FINORA AI")
+        canvas.setFillColor(colors.HexColor("#667085")); canvas.setFont("Helvetica",7.5)
+        canvas.drawRightString(PAGE_W-18*mm,PAGE_H-11*mm,"FINANCIAL INTELLIGENCE")
+    canvas.setStrokeColor(colors.HexColor("#E3E7EF")); canvas.line(18*mm,12*mm,PAGE_W-18*mm,12*mm)
+    canvas.setFillColor(colors.HexColor("#667085")); canvas.setFont("Helvetica",6.7)
+    canvas.drawString(18*mm,7.5*mm,"CONFIDENTIAL · FINORA AI")
+    canvas.drawRightString(PAGE_W-18*mm,7.5*mm,f"{doc.page:02d}")
+    canvas.restoreState()
+
+
+
+class Concept3MoneyFlowDashboard(Flowable):
+    """Premium money-flow dashboard with aligned four-step statement cards."""
+    def __init__(self, flow, health, formula, width=174*mm):
+        super().__init__()
+        self.flow = flow
+        self.health = health
+        self.formula = formula
+        self.width = width
+        self.height = 112*mm
+
+    def wrap(self, availWidth, availHeight):
+        self.width = min(self.width, availWidth)
+        return self.width, self.height
+
+    def draw(self):
+        c = self.canv
+        W = self.width
+
+        # Four equal cards with fixed gutters.  The header is deliberately
+        # two-line so long labels never collide with the icon or leave the
+        # card boundary.
+        gap = 5*mm
+        card_w = (W - 3*gap) / 4
+        card_h = 44*mm
+        y = self.height - 48*mm
+        radius = 4*mm
+
+        accents = [
+            colors.HexColor('#8B5CF6'),
+            colors.HexColor('#4F7CFF'),
+            colors.HexColor('#22B8A7'),
+            colors.HexColor('#0B1220'),
+        ]
+        labels = [
+            ('OPENING', 'BALANCE'),
+            ('TOTAL', 'SPENDING'),
+            ('PAYMENTS /', 'CREDITS'),
+            ('CLOSING', 'BALANCE'),
+        ]
+
+        for i, (_, value, _) in enumerate(self.flow):
+            x = i * (card_w + gap)
+            dark = i == 3
+
+            # Card.
+            c.setFillColor(colors.HexColor('#0B1220') if dark else colors.white)
+            c.setStrokeColor(colors.HexColor('#DDE3EF'))
+            c.setLineWidth(0.8)
+            c.roundRect(x, y, card_w, card_h, radius, fill=1, stroke=1)
+
+            # Icon badge.
+            icon_x = x + 10*mm
+            icon_y = y + card_h - 11*mm
+            c.setFillColor(accents[i])
+            c.circle(icon_x, icon_y, 6*mm, fill=1, stroke=0)
+            c.setFillColor(colors.white)
+            c.setFont('Helvetica-Bold', 9)
+            c.drawCentredString(icon_x, icon_y - 3, '■')
+
+            # Two-line label.  The second line is intentionally kept separate
+            # so PAYMENTS / CREDITS and CLOSING BALANCE remain inside the card.
+            label_color = colors.HexColor('#C4B5FD') if dark else accents[i]
+            c.setFillColor(label_color)
+            c.setFont('Helvetica-Bold', 6.2)
+            c.drawString(x + 19*mm, y + card_h - 9*mm, labels[i][0])
+            c.drawString(x + 19*mm, y + card_h - 13*mm, labels[i][1])
+
+            # Amount and currency are aligned identically on every card.
+            amount_color = colors.white if dark else colors.HexColor('#182235')
+            muted_color = colors.HexColor('#CBD5E1') if dark else colors.HexColor('#667085')
+            c.setFillColor(amount_color)
+            c.setFont('Helvetica-Bold', 13)
+            c.drawString(x + 8*mm, y + 17*mm, f'{float(value):,.2f}')
+            c.setFillColor(muted_color)
+            c.setFont('Helvetica', 6.3)
+            c.drawString(x + 8*mm, y + 9*mm, 'AED')
+
+            # Arrow sits exactly in the middle of each gutter, never inside a
+            # card.  This removes the previous visual collision.
+            if i < 3:
+                arrow_x = x + card_w + gap/2
+                c.setFillColor(colors.HexColor('#7C5CFC'))
+                c.setFont('Helvetica-Bold', 13)
+                c.drawCentredString(arrow_x, y + card_h/2 - 3, '→')
+
+        # Statement health strip.
+        hy = 16*mm
+        hh = 22*mm
+        c.setFillColor(colors.white)
+        c.setStrokeColor(colors.HexColor('#DDE3EF'))
+        c.setLineWidth(0.7)
+        c.roundRect(0, hy, W, hh, 3*mm, fill=1, stroke=1)
+
+        health_labels = [
+            ('Credit limit', self.health.get('limit')),
+            ('Available', self.health.get('available')),
+            ('Utilization', self.health.get('utilization')),
+            ('Reconciled', self.health.get('reconciled')),
+        ]
+        seg = W / 4
+        for i, (lab, val) in enumerate(health_labels):
+            x = i * seg
+            if i:
+                c.setStrokeColor(colors.HexColor('#E5EAF2'))
+                c.line(x, hy + 3*mm, x, hy + hh - 3*mm)
+            c.setFillColor(colors.HexColor('#667085'))
+            c.setFont('Helvetica', 6.4)
+            c.drawString(x + 4*mm, hy + 13*mm, lab)
+            c.setFillColor(colors.HexColor('#16A34A') if i == 3 else colors.HexColor('#182235'))
+            c.setFont('Helvetica-Bold', 10)
+            c.drawString(x + 4*mm, hy + 6*mm, str(val))
+
+        c.setFillColor(colors.HexColor('#667085'))
+        c.setFont('Helvetica', 6.1)
+        c.drawString(0, 4.5*mm, self.formula)
+
+class Concept3BehaviourDashboard(Flowable):
+    """Premium dark category-spending card with emoji/category pictograms."""
+
+    EMOJIS = {
+        "uncategorized": "🗂️",
+        "other": "📦",
+        "food & dining": "🍽️",
+        "food": "🍽️",
+        "groceries": "🛒",
+        "transportation": "🚗",
+        "shopping": "🛍️",
+        "bills & utilities": "💡",
+        "healthcare": "💊",
+        "saloon": "💇",
+        "entertainment": "🎮",
+        "education": "🎓",
+        "housing": "🏠",
+        "rent": "🏠",
+        "travel": "✈️",
+        "subscriptions": "📱",
+        "insurance": "🛡️",
+        "cash": "💵",
+    }
+
+    def __init__(self, data, spend, width=174 * mm):
+        super().__init__()
+        self.data = data
+        self.spend = float(spend or 0)
+        self.width = width
+        self.height = 132 * mm
+
+    def wrap(self, availWidth, availHeight):
+        self.width = min(self.width, availWidth)
+        return self.width, self.height
+
+    @classmethod
+    def emoji_for(cls, name):
+        key = str(name).strip().lower()
+        if key in cls.EMOJIS:
+            return cls.EMOJIS[key]
+        for token, emoji in cls.EMOJIS.items():
+            if token in key:
+                return emoji
+        return "💳"
+
+    def draw(self):
+        c = self.canv
+        W, H = self.width, self.height
+
+        # Dark premium card, closely matching the supplied reference.
+        c.setFillColor(colors.HexColor("#15171C"))
+        c.setStrokeColor(colors.HexColor("#2B2E35"))
+        c.setLineWidth(1.0)
+        c.roundRect(0, 0, W, H, 7 * mm, fill=1, stroke=1)
+
+        pad = 10 * mm
+        title_y = H - 13 * mm
+
+        # Chart emoji + title.
+        c.setFont(TWEMOJI_FONT, 12)
+        c.setFillColor(colors.white)
+        c.drawString(pad, title_y, "📊")
+        c.setFont("Helvetica-Bold", 14)
+        c.setFillColor(colors.HexColor("#F4F5F7"))
+        c.drawString(pad + 10 * mm, title_y + 1, "Spending by category")
+
+        rows = sorted(self.data, key=lambda x: float(x[1]), reverse=True)
+        if not rows:
+            return
+
+        # Fit all categories cleanly without overlapping.
+        max_amount = max(float(v) for _, v, _ in rows) or 1.0
+        row_top = H - 27 * mm
+        row_step = min(13.1 * mm, (H - 35 * mm) / max(len(rows), 1))
+        label_x = pad + 11 * mm
+        value_x = W - pad
+        track_x = pad
+        track_w = W - 2 * pad
+        bar_h = 3.2 * mm
+
+        for i, (name, amount, count) in enumerate(rows):
+            amount = float(amount)
+            cy = row_top - i * row_step
+
+            # Emoji pictogram.
+            c.setFont(TWEMOJI_FONT, 12)
+            c.setFillColor(colors.white)
+            c.drawString(track_x, cy - 2.5 * mm, self.emoji_for(name))
+
+            # Category name.
+            c.setFillColor(colors.HexColor("#F4F5F7"))
+            c.setFont("Helvetica", 9.3)
+            label = str(name)
+            if len(label) > 25:
+                label = label[:24] + "…"
+            c.drawString(label_x, cy, label)
+
+            # Amount.
+            c.setFillColor(colors.HexColor("#AEB3BE"))
+            c.setFont("Helvetica", 9.0)
+            c.drawRightString(value_x, cy, f"{amount:,.2f}")
+
+            # Track and fill.
+            track_y = cy - 7.2 * mm
+            c.setFillColor(colors.HexColor("#1D2026"))
+            c.roundRect(track_x, track_y, track_w, bar_h, 1.6 * mm, fill=1, stroke=0)
+
+            fill_w = track_w * max(0.0, min(1.0, amount / max_amount))
+            c.setFillColor(colors.HexColor("#50D0D4"))
+            c.roundRect(track_x, track_y, fill_w, bar_h, 1.6 * mm, fill=1, stroke=0)
+
+        # Small explanatory footer.
+        c.setFillColor(colors.HexColor("#7E8490"))
+        c.setFont("Helvetica", 5.8)
+        c.drawString(
+            pad,
+            5.5 * mm,
+            "Ranked by total spend · transaction counts remain available in the report tables.",
+        )
+
+
+class Concept3SignalsDashboard(Flowable):
+    """Four intelligence cards in a 2x2 grid plus a recommendation rail."""
+    def __init__(self, signals, recommendations, width=174*mm):
+        super().__init__(); self.signals=signals; self.recommendations=recommendations; self.width=width; self.height=92*mm
+    def wrap(self, availWidth, availHeight): self.width=min(self.width,availWidth); return self.width,self.height
+    def draw(self):
+        c=self.canv; W=self.width; H=self.height; rail_w=58*mm; gap=5*mm; left_w=W-rail_w-gap; card_w=(left_w-4*mm)/2; card_h=37*mm
+        for i,(num,title,body,accent,bg,metric) in enumerate(self.signals):
+            col=i%2; row=i//2; x=col*(card_w+4*mm); y=H-((row+1)*card_h+row*4*mm)
+            c.setFillColor(bg); c.setStrokeColor(colors.HexColor('#DDE3EF')); c.roundRect(x,y,card_w,card_h,3*mm,fill=1,stroke=1)
+            c.setFillColor(accent); c.circle(x+8*mm,y+card_h-8*mm,4.5*mm,fill=1,stroke=0); c.setFillColor(colors.white); c.setFont('Helvetica-Bold',6); c.drawCentredString(x+8*mm,y+card_h-10*mm,num)
+            c.setFillColor(accent); c.setFont('Helvetica-Bold',5.8); c.drawString(x+15*mm,y+card_h-6*mm,title[:24])
+            c.setFillColor(colors.HexColor('#182235')); c.setFont('Helvetica',5.4); words=body.split(); line=''; yy=y+card_h-17*mm
+            for w in words:
+                test=(line+' '+w).strip()
+                if len(test)>31: c.drawString(x+5*mm,yy,line); yy-=6.2; line=w
+                else: line=test
+            if line: c.drawString(x+5*mm,yy,line)
+            if metric:
+                c.setFillColor(accent); c.roundRect(x+5*mm,y+4*mm,card_w-10*mm,3.5*mm,1.5*mm,fill=1,stroke=0)
+        rail_x=left_w+gap; c.setFillColor(colors.HexColor('#F8F9FC')); c.setStrokeColor(colors.HexColor('#DDE3EF')); c.roundRect(rail_x,0,rail_w,H-1*mm,3*mm,fill=1,stroke=1)
+        c.setFillColor(colors.HexColor('#182235')); c.setFont('Helvetica-Bold',7); c.drawString(rail_x+5*mm,H-10*mm,'Recommended actions')
+        yy=H-21*mm
+        for i,rec in enumerate(self.recommendations[:3],1):
+            c.setFillColor(colors.HexColor('#EEF0FF')); c.circle(rail_x+8*mm,yy,4*mm,fill=1,stroke=0); c.setFillColor(colors.HexColor('#7C5CFC')); c.setFont('Helvetica-Bold',6); c.drawCentredString(rail_x+8*mm,yy-2,str(i))
+            c.setFillColor(colors.HexColor('#182235')); c.setFont('Helvetica',5.2); words=rec.split(); line=''; ry=yy+2
+            for w in words:
+                test=(line+' '+w).strip()
+                if len(test)>28: c.drawString(rail_x+15*mm,ry,line); ry-=6; line=w
+                else: line=test
+            if line: c.drawString(rail_x+15*mm,ry,line)
+            yy-=22*mm
+
+
+def _build_report(transactions, file_name=None, statement_metadata=None):
+    """Build the final Concept 3 Finora report from the live transaction set.
+
+    The function intentionally does not deduplicate transactions. The parser's
+    canonical transaction list is the single source of truth; repeated merchants
+    remain when their underlying transactions differ.
+    """
     txs = _sort_transactions(transactions)
     metadata = dict(statement_metadata or {})
-    credit_card = _is_credit_card(metadata, txs)
-    styles = _styles()
+    styles = _concept3_styles()
 
-    currencies = [
-        str(getattr(tx, "original_currency", "") or "").upper()
-        for tx in txs
-        if getattr(tx, "original_currency", None)
-    ]
-    currency = max(set(currencies), key=currencies.count) if currencies else "UNKNOWN"
+    currency_values = [str(getattr(t, "original_currency", "") or "").upper() for t in txs if getattr(t, "original_currency", None)]
+    currency = Counter(currency_values).most_common(1)[0][0] if currency_values else "AED"
 
-    income = sum(
-        abs(_n(getattr(tx, "original_amount", 0)))
-        for tx in txs
-        if _enum(getattr(tx, "direction", None)).lower() == "credit"
-    )
-    expenses = sum(
-        abs(_n(getattr(tx, "original_amount", 0)))
-        for tx in txs
-        if _enum(getattr(tx, "direction", None)).lower() != "credit"
-    )
-    net = income - expenses
-    review_count = sum(bool(getattr(tx, "requires_review", False)) for tx in txs)
+    debits = [t for t in txs if _enum(getattr(t, "direction", None)).lower() != "credit"]
+    credits = [t for t in txs if _enum(getattr(t, "direction", None)).lower() == "credit"]
+    spend = sum(abs(_n(getattr(t, "original_amount", 0))) for t in debits)
+    credit_total = sum(abs(_n(getattr(t, "original_amount", 0))) for t in credits)
 
-    outgoing_count = sum(
-        1 for tx in txs
-        if _enum(getattr(tx, "direction", None)).lower() != "credit"
-    )
-    meaningful_categories = 0
-    category_totals = defaultdict(float)
-    merchant_totals = defaultdict(float)
+    categories = defaultdict(float); category_counts = Counter()
+    merchants = defaultdict(float); merchant_counts = Counter()
+    for t in debits:
+        amount = abs(_n(getattr(t, "original_amount", 0)))
+        categories[_cat_name(t)] += amount
+        category_counts[_cat_name(t)] += 1
+        merchants[_merchant_name(t)] += amount
+        merchant_counts[_merchant_name(t)] += 1
+    category_rows = sorted(categories.items(), key=lambda x:x[1], reverse=True)
+    merchant_rows = sorted(merchants.items(), key=lambda x:x[1], reverse=True)
+    category_data = [(name, amount, amount/spend*100 if spend else 0) for name, amount in category_rows]
+    behaviour_data = [(name, amount, category_counts[name]) for name, amount in category_rows]
 
-    for tx in txs:
-        if _enum(getattr(tx, "direction", None)).lower() != "debit":
-            continue
-        amount = abs(_n(getattr(tx, "original_amount", 0)))
-        category = _cat_name(tx)
-        merchant = _merchant_name(tx)
-        category_totals[category] += amount
-        merchant_totals[merchant] += amount
-        if category.casefold() not in {"uncategorized", "unknown", "other", ""}:
-            meaningful_categories += 1
+    dates = [getattr(t, "transaction_date", None) for t in txs if getattr(t, "transaction_date", None) is not None]
+    period = f"{min(dates):%d %b %Y} – {max(dates):%d %b %Y}" if dates else "Statement period"
 
-    category_rows = sorted(category_totals.items(), key=lambda x: x[1], reverse=True)
-    merchant_rows = sorted(merchant_totals.items(), key=lambda x: x[1], reverse=True)
-    category_coverage = (meaningful_categories / outgoing_count * 100) if outgoing_count else 0.0
+    statement_type = str(metadata.get("statement_type") or "").lower()
+    credit_card = statement_type == "credit_card" or any(str(getattr(t, "statement_type", "")).lower().endswith("credit_card") for t in txs)
+    card_limit = _n(metadata.get("card_limit")) if metadata.get("card_limit") is not None else None
+    current_balance = _n(metadata.get("current_balance")) if metadata.get("current_balance") is not None else None
+    available_credit = _n(metadata.get("available_limit")) if metadata.get("available_limit") is not None else None
+    if credit_card and available_credit is None and card_limit is not None and current_balance is not None:
+        available_credit = card_limit - current_balance
+    utilization = (current_balance/card_limit*100) if credit_card and current_balance is not None and card_limit else None
+    total_due = _n(metadata.get("total_payment_due")) if metadata.get("total_payment_due") is not None else current_balance
+    minimum_due = _n(metadata.get("minimum_payment_due")) if metadata.get("minimum_payment_due") is not None else None
+    opening = _n(metadata.get("opening_balance")) if metadata.get("opening_balance") is not None else None
+    review_count = sum(bool(getattr(t, "requires_review", False)) for t in txs)
 
-    # Prefer exact statement metadata for the credit-card headline metrics.
-    card_limit = _metadata_number(metadata, "card_limit")
-    current_balance = _metadata_number(metadata, "current_balance")
-    available_limit = _metadata_number(metadata, "available_limit")
-    minimum_due = _metadata_number(metadata, "minimum_payment_due")
-    total_due = _metadata_number(metadata, "total_payment_due")
-    charges = _metadata_number(metadata, "profit_other_charges")
-    opening_balance = _metadata_number(metadata, "opening_balance")
-    due_date = metadata.get("payment_due_date")
+    # Weekly series.
+    weekly = defaultdict(lambda:[0.0,0.0])
+    for t in txs:
+        d = getattr(t,"transaction_date",None)
+        if d is None: continue
+        week = d - timedelta(days=d.weekday())
+        amount = abs(_n(getattr(t,"original_amount",0)))
+        if _enum(getattr(t,"direction",None)).lower() == "credit": weekly[week][1] += amount
+        else: weekly[week][0] += amount
+    weekly_series = [(d.strftime("%d %b"),v[0],v[1]) for d,v in sorted(weekly.items())][-8:]
 
-    if credit_card:
-        if total_due is None and current_balance is not None:
-            total_due = current_balance
-        if available_limit is None and card_limit is not None and current_balance is not None:
-            available_limit = card_limit - current_balance
-        if current_balance is None and opening_balance is not None:
-            current_balance = opening_balance + expenses - income
-        if card_limit is not None and current_balance is not None and available_limit is None:
-            available_limit = max(0.0, card_limit - current_balance)
-
-    utilization = None
-    if credit_card and card_limit and current_balance is not None:
-        utilization = (current_balance / card_limit) * 100
-
-    top_category = category_rows[0] if category_rows else ("Not available", 0.0)
-    top_merchant = merchant_rows[0] if merchant_rows else ("Not available", 0.0)
-    largest = _largest_transactions(txs)
-    repeated = _repeated_merchants(txs)
-    weekly = _weekly_series(txs)
+    def safe_money(v): return f"{currency} {v:,.2f}"
+    top_category = category_rows[0] if category_rows else ("No category",0.0)
+    top_merchant = merchant_rows[0] if merchant_rows else ("No merchant",0.0)
+    repeated = [(m,merchant_counts[m],amount) for m,amount in merchant_rows if merchant_counts[m] >= 2][:8]
+    category_coverage = (sum(category_counts[k] for k in categories if k.casefold() not in {"uncategorized","unknown",""}) / len(debits) * 100) if debits else 0
 
     if credit_card:
-        story = (
-            f"Current card balance is <b>{_money(current_balance or 0, currency)}</b> "
-            f"against a <b>{_money(card_limit or 0, currency)}</b> credit limit, "
-            f"leaving <b>{_money(available_limit or 0, currency)}</b> available. "
-            f"Total payment due is <b>{_money(total_due or 0, currency)}</b>."
+        executive = (
+            f"Current balance is <b>{safe_money(current_balance or 0)}</b> against a <b>{safe_money(card_limit or 0)}</b> limit, "
+            f"leaving <b>{safe_money(available_credit or 0)}</b> available. Total outgoing spending is <b>{safe_money(spend)}</b> "
+            f"across {len(debits):,} transactions."
         )
     else:
-        story = (
-            f"You received <b>{_money(income, currency)}</b> and spent "
-            f"<b>{_money(expenses, currency)}</b>. "
-            + (
-                f"That leaves a positive net movement of <b>{_money(net, currency)}</b>."
-                if net >= 0
-                else f"Spending was higher than incoming money by <b>{_money(abs(net), currency)}</b>."
-            )
-        )
+        net = credit_total - spend
+        executive = f"Received <b>{safe_money(credit_total)}</b> and spent <b>{safe_money(spend)}</b>. Net movement is <b>{safe_money(net)}</b>."
 
-    buffer = BytesIO()
-    doc = FinoraReportDocTemplate(
-        buffer,
-        leftMargin=14 * mm,
-        rightMargin=14 * mm,
-        topMargin=19 * mm,
-        bottomMargin=16 * mm,
-        title="Finora AI Financial Intelligence Report",
-        author="Finora AI",
-    )
-
-    story_flow = []
-    report_name = "Credit card statement report" if credit_card else "Financial statement report"
-
-    # ========================================================
-    # PAGE 1 - EXECUTIVE SUMMARY
-    # ========================================================
-    story_flow.append(Spacer(1, 4 * mm))
-    story_flow.append(Paragraph("Finora AI Financial Intelligence Report", styles["title"]))
-    story_flow.append(Paragraph(
-        f"{escape(report_name)} · {escape(_safe_text(file_name, 'Financial statement'))} · {escape(currency)} · {len(txs):,} transactions",
-        styles["subtitle"],
-    ))
-    story_flow.append(Spacer(1, 3.5 * mm))
-
-    if credit_card:
-        metrics = [[
-            Paragraph("CARD LIMIT", styles["metric_label"]),
-            Paragraph("CURRENT BALANCE", styles["metric_label"]),
-            Paragraph("AVAILABLE CREDIT", styles["metric_label"]),
-            Paragraph("TOTAL PAYMENT DUE", styles["metric_label"]),
-            Paragraph("MINIMUM PAYMENT DUE", styles["metric_label"]),
-        ], [
-            Paragraph(_colored_money(card_limit or 0, currency, INDIGO), styles["metric_value"]),
-            Paragraph(_colored_money(current_balance or 0, currency, RED), styles["metric_value"]),
-            Paragraph(_colored_money(available_limit or 0, currency, GREEN), styles["metric_value"]),
-            Paragraph(_colored_money(total_due or 0, currency, INDIGO), styles["metric_value"]),
-            Paragraph(_colored_money(minimum_due or 0, currency, AMBER), styles["metric_value"]),
-        ]]
-        table = _box_table(metrics, [48 * mm] * 5, padding=5.5, background=colors.HexColor("#FAFBFD"))
-        story_flow.append(table)
-        story_flow.append(Spacer(1, 2.5 * mm))
-
-        facts = [[
-            Paragraph("PAYMENT DUE DATE", styles["metric_label"]),
-            Paragraph("CREDIT UTILIZATION", styles["metric_label"]),
-            Paragraph("PROFIT / OTHER CHARGES", styles["metric_label"]),
-            Paragraph("TRANSACTIONS", styles["metric_label"]),
-            Paragraph("REVIEW ITEMS", styles["metric_label"]),
-        ], [
-            Paragraph(escape(_safe_text(due_date, "Not stated")), styles["metric_value_small"]),
-            Paragraph(f"{utilization:.1f}%" if utilization is not None else "Not available", styles["metric_value_small"]),
-            Paragraph(_money(charges or 0, currency), styles["metric_value_small"]),
-            Paragraph(f"{len(txs):,}", styles["metric_value_small"]),
-            Paragraph(f"{review_count:,}", styles["metric_value_small"]),
-        ]]
-        story_flow.append(_box_table(facts, [48 * mm] * 5, padding=5, background=INDIGO_LIGHT))
-        story_flow.append(Spacer(1, 3.5 * mm))
-
-        if utilization is not None:
-            bar_data = [[
-                Paragraph("CREDIT UTILIZATION", styles["metric_label"]),
-                Paragraph(f"{utilization:.1f}% of limit used", styles["metric_value_small"]),
-            ]]
-            util_table = Table(bar_data, colWidths=[50 * mm, 40 * mm,], hAlign="LEFT")
-            util_table.setStyle(TableStyle([
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-                ("TOPPADDING", (0, 0), (-1, -1), 0),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-            ]))
-            story_flow.append(util_table)
-            # Visual utilization bar using a tiny one-row table.
-            used = max(0.0, min(100.0, utilization))
-            remaining = 100.0 - used
-            util_bar = Table([["", ""]], colWidths=[240 * mm * used / 100, 240 * mm * remaining / 100], rowHeights=[4.5 * mm])
-            util_bar.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (0, 0), INDIGO),
-                ("BACKGROUND", (1, 0), (1, 0), colors.HexColor("#E8EBF2")),
-                ("BOX", (0, 0), (-1, -1), 0, WHITE),
-                ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-                ("TOPPADDING", (0, 0), (-1, -1), 0),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-            ]))
-            story_flow.append(util_bar)
-            story_flow.append(Spacer(1, 3.2 * mm))
-    else:
-        metric_data = [[
-            Paragraph("RECEIVED", styles["metric_label"]),
-            Paragraph("SPENT", styles["metric_label"]),
-            Paragraph("NET MOVEMENT", styles["metric_label"]),
-            Paragraph("ACTIVITY", styles["metric_label"]),
-            Paragraph("NEEDS REVIEW", styles["metric_label"]),
-        ], [
-            Paragraph(_colored_money(income, currency, GREEN), styles["metric_value"]),
-            Paragraph(_colored_money(expenses, currency, RED), styles["metric_value"]),
-            Paragraph(_colored_money(net, currency, INDIGO), styles["metric_value"]),
-            Paragraph(f"{len(txs):,}", styles["metric_value"]),
-            Paragraph(_colored_text(f"{review_count:,}", AMBER), styles["metric_value"]),
-        ]]
-        metrics = _box_table(metric_data, [48 * mm] * 5, padding=5.5, background=colors.HexColor("#FAFBFD"))
-        story_flow.append(metrics)
-        story_flow.append(Spacer(1, 3.5 * mm))
-
-    story_flow.append(Paragraph("Statement facts", styles["section"]))
-    fact_left = [
-        [Paragraph("STATEMENT TYPE", styles["metric_label"]), Paragraph("CREDIT CARD" if credit_card else "BANK / FINANCIAL STATEMENT", styles["metric_value_small"])],
-        [Paragraph("CURRENCY", styles["metric_label"]), Paragraph(escape(currency), styles["metric_value_small"])],
-        [Paragraph("TRANSACTIONS ANALYZED", styles["metric_label"]), Paragraph(f"{len(txs):,}", styles["metric_value_small"])],
-    ]
-    if credit_card:
-        fact_right = [
-            [Paragraph("OPENING BALANCE", styles["metric_label"]), Paragraph(_money(opening_balance, currency) if opening_balance is not None else "Not stated", styles["metric_value_small"])],
-            [Paragraph("CURRENT BALANCE", styles["metric_label"]), Paragraph(_money(current_balance, currency) if current_balance is not None else "Not stated", styles["metric_value_small"])],
-            [Paragraph("DUE DATE", styles["metric_label"]), Paragraph(escape(_safe_text(due_date, "Not stated")), styles["metric_value_small"])],
-        ]
-    else:
-        fact_right = [
-            [Paragraph("OPENING BALANCE", styles["metric_label"]), Paragraph(_money(metadata.get("opening_balance"), currency) if metadata.get("opening_balance") is not None else "Not stated", styles["metric_value_small"])],
-            [Paragraph("CLOSING BALANCE", styles["metric_label"]), Paragraph(_money(metadata.get("closing_balance"), currency) if metadata.get("closing_balance") is not None else "Not stated", styles["metric_value_small"])],
-            [Paragraph("STATEMENT PERIOD", styles["metric_label"]), Paragraph(escape(_safe_text(metadata.get("statement_period") or (str(metadata.get("statement_start_date", "")) + " - " + str(metadata.get("statement_end_date", ""))), "Not stated")), styles["metric_value_small"])],
-        ]
-
-    fact_table = Table([
-        [_box_table(fact_left, [48 * mm, 65 * mm], padding=5, background=SOFT), _box_table(fact_right, [48 * mm, 65 * mm], padding=5, background=SOFT)],
-    ], colWidths=[120 * mm, 120 * mm], hAlign="LEFT")
-    fact_table.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, -1), 0),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+    story=[]
+    # Cover
+    cover = Table([
+        [Paragraph("FINORA", ParagraphStyle("brand3",fontName="Helvetica-Bold",fontSize=12,textColor=colors.HexColor("#A78BFA")))],
+        [Spacer(1,18*mm)],
+        [Paragraph("Your money.<br/><font color='#A78BFA'>Explained.</font>",styles["title"])],
+        [Spacer(1,5*mm)],
+        [Paragraph("Financial Intelligence Report",ParagraphStyle("cover_sub",fontName="Helvetica",fontSize=13,textColor=colors.HexColor("#E2E8F0")))],
+        [Spacer(1,8*mm)],
+        [Paragraph(f"{escape(period)} · {escape(currency)} · {len(txs):,} transactions",styles["white"])],
+        [Spacer(1,18*mm)],
+        [Paragraph(f"<b>EXECUTIVE SIGNAL</b><br/><br/>{executive}",styles["white"])],
+    ], colWidths=[174*mm])
+    cover.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,-1),colors.HexColor("#0B1220")),
+        ("LEFTPADDING",(0,0),(-1,-1),15*mm),("RIGHTPADDING",(0,0),(-1,-1),15*mm),
+        ("TOPPADDING",(0,0),(-1,-1),12*mm),("BOTTOMPADDING",(0,0),(-1,-1),12*mm),
     ]))
-    story_flow.append(fact_table)
-    story_flow.append(Spacer(1, 2.8 * mm))
+    story += [Spacer(1,7*mm),cover,Spacer(1,7*mm)]
+    cards = Table([[
+        _c3_card("Statement balance" if credit_card else "Total received", safe_money(current_balance if credit_card else credit_total), "Closing balance" if credit_card else "Credits / inflow", colors.HexColor("#7C5CFC"), styles),
+        _c3_card("Total spending", safe_money(spend), f"{len(debits):,} outgoing", colors.HexColor("#4F7CFF"), styles),
+        _c3_card("Utilization" if credit_card else "Net movement", f"{utilization:.1f}%" if utilization is not None else safe_money(credit_total-spend), safe_money(available_credit or 0)+" available" if credit_card else "Credits minus spending", colors.HexColor("#22C55E"), styles),
+    ]], colWidths=[56*mm]*3)
+    cards.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP"),("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),4)]))
+    story += [cards,PageBreak()]
 
-    story_flow.append(Paragraph("Finora's executive read", styles["section"]))
-    story_flow.append(_box_table(
-        [[Paragraph(story, styles["insight"])]],
-        [240 * mm],
-        padding=8,
-        background=INDIGO_LIGHT,
-    ))
+    # Spending map
+    story += [Spacer(1,4*mm),Paragraph("01 / SPENDING MAP",ParagraphStyle("kick1",fontName="Helvetica-Bold",fontSize=7.5,textColor=colors.HexColor("#7C5CFC"))),Paragraph("Where your money went",styles["heading"]),Paragraph("One visual map of the complete outgoing spend. Categories are not repeated elsewhere as another visual chart.",styles["small"]),Spacer(1,3*mm)]
+    donut_data=[]
+    for i,(name,amount,pct) in enumerate(category_data):
+        donut_data.append((name,amount,pct))
+    story += [Concept3SpendingDonut(donut_data),Spacer(1,2*mm)]
+    pool_left=f"{escape(top_category[0])}: {safe_money(top_category[1])} ({(top_category[1]/spend*100 if spend else 0):.1f}%)"
+    food_name="Food & Dining"; food_count=category_counts.get(food_name,0)
+    pool_right=f"{food_name} has {food_count:,} transactions — the highest frequency category." if food_count else "Transaction frequency is not available for a category-level signal."
+    call=_c3_box([[Paragraph("<b>BIGGEST VALUE POOL</b>",styles["h2"]),Paragraph("<b>FREQUENCY SIGNAL</b>",styles["h2"])],[Paragraph(pool_left,styles["body"]),Paragraph(pool_right,styles["body"])]],[83*mm,83*mm],styles,background=colors.white,padding=8)
+    story += [call,PageBreak()]
 
-    # Keep page 1 focused on the account/card snapshot and executive read.
-    # The category visualization starts on page 2 so its heading and bars never split.
-    story_flow.append(PageBreak())
-
-    # ========================================================
-    # PAGE 2 - SPENDING + MERCHANT INTELLIGENCE
-    # ========================================================
-    story_flow.append(Spacer(1, 4 * mm))
-    story_flow.append(Paragraph("Spending and merchant intelligence", styles["title"]))
-    story_flow.append(Paragraph(
-        "Category concentration and merchant activity derived from the finalized transaction set.",
-        styles["subtitle"],
-    ))
-    story_flow.append(Spacer(1, 2 * mm))
-
-    story_flow.append(Paragraph("Spending by category", styles["section"]))
-    if category_rows:
-        story_flow.append(FinoraBarChart(category_rows))
+    # Money flow — redesigned dashboard.
+    if credit_card and opening is not None:
+        flow=[("OPENING BALANCE",opening,colors.HexColor("#7C5CFC")),("TOTAL SPENDING",spend,colors.HexColor("#4F7CFF")),("PAYMENTS / CREDITS",credit_total,colors.HexColor("#19B5A5")),("CLOSING BALANCE",current_balance or (opening+spend-credit_total),colors.HexColor("#0B1220"))]
+        calc=opening+spend-credit_total; diff=calc-(current_balance or calc)
     else:
-        story_flow.append(Paragraph("No outgoing transactions were available for category analysis.", styles["small"]))
+        flow=[("OPENING BALANCE",opening or 0,colors.HexColor("#7C5CFC")),("RECEIVED",credit_total,colors.HexColor("#19B5A5")),("SPENT",spend,colors.HexColor("#EF5B5B")),("CLOSING BALANCE",_n(metadata.get("closing_balance")) if metadata.get("closing_balance") is not None else (opening+credit_total-spend if opening is not None else credit_total-spend),colors.HexColor("#0B1220"))]
+        calc=(opening+credit_total-spend) if opening is not None else None; supplied=_n(metadata.get("closing_balance")) if metadata.get("closing_balance") is not None else None; diff=(calc-supplied) if calc is not None and supplied is not None else None
+    health={"limit":safe_money(card_limit or 0),"available":safe_money(available_credit or 0),"utilization":f"{utilization:.1f}%" if utilization is not None else "N/A","reconciled":"YES" if diff is not None and abs(diff)<0.01 else "CHECK"}
+    formula=(f"Formula: {safe_money(opening)}  +  {safe_money(spend)}  −  {safe_money(credit_total)}  =  {safe_money(current_balance or calc)}" if credit_card and opening is not None else "Statement-level reconciliation shown from the supplied metadata.")
+    story += [Spacer(1,4*mm),Paragraph("02 / MONEY FLOW",ParagraphStyle("kick2",fontName="Helvetica-Bold",fontSize=7.5,textColor=colors.HexColor("#7C5CFC"))),Paragraph("Follow the statement",styles["heading"]),Paragraph("A visual reconciliation of the statement from opening position to closing balance.",styles["small"]),Spacer(1,4*mm),Concept3MoneyFlowDashboard(flow,health,formula),PageBreak()]
 
-    story_flow.append(Paragraph("Top outgoing merchants", styles["section"]))
+    # Category intelligence — page 3 after removing the redundant behaviour chart.
+    # Category intelligence
+    story += [Spacer(1,4*mm),Paragraph("03 / CATEGORY INTELLIGENCE",ParagraphStyle("kick3",fontName="Helvetica-Bold",fontSize=7.5,textColor=colors.HexColor("#7C5CFC"))),Paragraph("Category performance",styles["heading"]),Paragraph("Spend, transaction count, average transaction and share — one canonical category table.",styles["small"]),Spacer(1,3*mm)]
+    cr=[[Paragraph(x,styles["table_head"]) for x in ["CATEGORY","SPEND","TXNS","AVG / TXN","SHARE"]]]
+    for name,amount in category_rows:
+        count=category_counts[name]; cr.append([Paragraph(escape(name),styles["table"]),Paragraph(safe_money(amount),styles["table_right"]),Paragraph(str(count),styles["table_right"]),Paragraph(safe_money(amount/count if count else 0),styles["table_right"]),Paragraph(f"{amount/spend*100:.1f}%" if spend else "0.0%",styles["table_right"])])
+    ct=Table(cr,colWidths=[49*mm,34*mm,20*mm,37*mm,20*mm],repeatRows=1)
+    ct.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#0B1220")),("BOX",(0,0),(-1,-1),.5,colors.HexColor("#E3E7EF")),("INNERGRID",(0,0),(-1,-1),.3,colors.HexColor("#E3E7EF")),("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#FAFBFD")]),("ALIGN",(1,1),(-1,-1),"RIGHT"),("LEFTPADDING",(0,0),(-1,-1),5),("RIGHTPADDING",(0,0),(-1,-1),5),("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5)]))
+    story += [ct,PageBreak()]
 
-    merchant_head = [
-        Paragraph("MERCHANT", styles["table_head"]),
-        Paragraph("SPENDING", styles["table_head"]),
-        Paragraph("SHARE OF OUTGOING", styles["table_head"]),
+    # Merchant intelligence
+    story += [Spacer(1,4*mm),Paragraph("04 / MERCHANT INTELLIGENCE",ParagraphStyle("kick4",fontName="Helvetica-Bold",fontSize=7.5,textColor=colors.HexColor("#7C5CFC"))),Paragraph("Merchant concentration",styles["heading"]),Paragraph("Top spenders and repeat activity are highlighted; transaction evidence remains only in the ledger.",styles["small"]),Spacer(1,3*mm)]
+    mr=[[Paragraph(x,styles["table_head"]) for x in ["MERCHANT","SPEND","TXNS","SHARE"]]]
+    for name,amount in merchant_rows[:12]: mr.append([Paragraph(escape(name),styles["table"]),Paragraph(safe_money(amount),styles["table_right"]),Paragraph(str(merchant_counts[name]),styles["table_right"]),Paragraph(f"{amount/spend*100:.1f}%" if spend else "0.0%",styles["table_right"])])
+    mt=Table(mr,colWidths=[96*mm,34*mm,20*mm,22*mm],repeatRows=1)
+    mt.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#0B1220")),("BOX",(0,0),(-1,-1),.5,colors.HexColor("#E3E7EF")),("INNERGRID",(0,0),(-1,-1),.3,colors.HexColor("#E3E7EF")),("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#FAFBFD")]),("ALIGN",(1,1),(-1,-1),"RIGHT"),("LEFTPADDING",(0,0),(-1,-1),5),("RIGHTPADDING",(0,0),(-1,-1),5),("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5)]))
+    story += [mt,Spacer(1,7*mm),Paragraph("Most frequent merchants",styles["h2"])]
+    fr=Table([[Paragraph(escape(name),styles["body"]),Paragraph(f"{merchant_counts[name]:,} transactions",styles["body"]),Paragraph(safe_money(amount),ParagraphStyle("mright",parent=styles["body"],alignment=TA_RIGHT))] for name,amount in merchant_rows if merchant_counts[name]>=2][:8],colWidths=[98*mm,40*mm,36*mm])
+    fr.setStyle(TableStyle([("BOX",(0,0),(-1,-1),.5,colors.HexColor("#E3E7EF")),("INNERGRID",(0,0),(-1,-1),.3,colors.HexColor("#E3E7EF")),("ROWBACKGROUNDS",(0,0),(-1,-1),[colors.white,colors.HexColor("#FAFBFD")]),("LEFTPADDING",(0,0),(-1,-1),6),("RIGHTPADDING",(0,0),(-1,-1),6),("TOPPADDING",(0,0),(-1,-1),6),("BOTTOMPADDING",(0,0),(-1,-1),6)]))
+    story += [fr,PageBreak()]
+
+    # Trend
+    story += [Spacer(1,4*mm),Paragraph("05 / SPENDING TREND",ParagraphStyle("kick5",fontName="Helvetica-Bold",fontSize=7.5,textColor=colors.HexColor("#7C5CFC"))),Paragraph("Weekly movement",styles["heading"]),Paragraph("Outgoing spending and credits/payments are shown together to reveal the statement rhythm.",styles["small"]),Spacer(1,3*mm),Concept3WeeklyChart(weekly_series),Spacer(1,2*mm)]
+    wr=[[Paragraph(x,styles["table_head"]) for x in ["WEEK","SPENDING","PAYMENTS / CREDITS"]]]
+    for label,spent,payments in weekly_series: wr.append([Paragraph(label,styles["table"]),Paragraph(safe_money(spent),styles["table_right"]),Paragraph(safe_money(payments),styles["table_right"])])
+    wt=Table(wr,colWidths=[55*mm,55*mm,55*mm],repeatRows=1)
+    wt.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#0B1220")),("BOX",(0,0),(-1,-1),.5,colors.HexColor("#E3E7EF")),("INNERGRID",(0,0),(-1,-1),.3,colors.HexColor("#E3E7EF")),("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#FAFBFD")]),("ALIGN",(1,1),(-1,-1),"RIGHT"),("LEFTPADDING",(0,0),(-1,-1),6),("RIGHTPADDING",(0,0),(-1,-1),6),("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5)]))
+    story += [wt,PageBreak()]
+
+    # Signals — redesigned intelligence dashboard.
+    signals=[
+        ("01","CLASSIFICATION GAP",f"{safe_money(categories.get('Uncategorized',0))} is Uncategorized across {category_counts.get('Uncategorized',0):,} transactions.",colors.HexColor("#7C5CFC"),colors.HexColor("#F3F0FF"),True),
+        ("02","FREQUENCY PATTERN",f"Food & Dining has {category_counts.get('Food & Dining',0):,} transactions and {safe_money(categories.get('Food & Dining',0))} of spend.",colors.HexColor("#4F7CFF"),colors.HexColor("#EEF4FF"),True),
+        ("03","CREDIT POSITION",f"{utilization:.1f}% utilization leaves {safe_money(available_credit or 0)} available." if utilization is not None else "Credit utilization was not supplied.",colors.HexColor("#22C55E"),colors.HexColor("#ECFDF3"),True),
+        ("04","STATEMENT INTEGRITY",("Calculated balance matches the supplied closing balance." if diff is not None and abs(diff)<0.01 else "A complete balance reconciliation could not be confirmed from the supplied metadata."),colors.HexColor("#F59E0B"),colors.HexColor("#FFF7E8"),False),
     ]
-    merchant_data = [merchant_head]
-    for merchant, amount in merchant_rows[:10]:
-        share = amount / expenses * 100 if expenses else 0
-        merchant_data.append([
-            Paragraph(escape(merchant), styles["table_cell"]),
-            Paragraph(_money(amount, currency), styles["table_cell_right"]),
-            Paragraph(f"{share:.1f}%", styles["table_cell_right"]),
-        ])
-    merchant_table = Table(merchant_data, colWidths=[128 * mm, 58 * mm, 54 * mm], repeatRows=1)
-    merchant_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), NAVY),
-        ("BOX", (0, 0), (-1, -1), 0.55, GRID),
-        ("INNERGRID", (0, 0), (-1, -1), 0.35, GRID),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 5),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-        ("TOPPADDING", (0, 0), (-1, -1), 3.5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 3.5),
-    ]))
-    story_flow.append(merchant_table)
-    story_flow.append(Spacer(1, 3 * mm))
+    recommendations=["Prioritize the largest Uncategorized merchants for classification.","Monitor Food & Dining by frequency, not only total value.","Use the ledger as the evidence layer; do not duplicate transactions in summary sections."]
+    story += [Spacer(1,4*mm),Paragraph("06 / FINORA SIGNALS",ParagraphStyle("kick6",fontName="Helvetica-Bold",fontSize=7.5,textColor=colors.HexColor("#7C5CFC"))),Paragraph("Reconciliation & intelligence",styles["heading"]),Paragraph("Control layer first, interpretation second.",styles["small"]),Spacer(1,3*mm),Concept3SignalsDashboard(signals,recommendations),PageBreak()]
 
-    top_metrics = [[
-        Paragraph("TOP CATEGORY", styles["metric_label"]),
-        Paragraph("TOP MERCHANT", styles["metric_label"]),
-        Paragraph("CATEGORY COVERAGE", styles["metric_label"]),
-        Paragraph("REPEATED MERCHANTS", styles["metric_label"]),
-    ], [
-        Paragraph(escape(top_category[0]), styles["metric_value_small"]),
-        Paragraph(escape(top_merchant[0]), styles["metric_value_small"]),
-        Paragraph(f"{category_coverage:.0f}%", styles["metric_value_small"]),
-        Paragraph(f"{len(repeated):,}", styles["metric_value_small"]),
-    ], [
-        Paragraph(_money(top_category[1], currency), styles["small"]),
-        Paragraph(_money(top_merchant[1], currency), styles["small"]),
-        Paragraph(f"{meaningful_categories:,} meaningful outgoing transactions", styles["small"]),
-        Paragraph("Merchant families appearing 2+ times", styles["small"]),
-    ]]
-    story_flow.append(_box_table(top_metrics, [60 * mm] * 4, padding=6, background=SOFT))
-    story_flow.append(Spacer(1, 3.5 * mm))
+    # Complete canonical ledger. No deduplication here.
+    show_review = review_count > 0
+    ledger_headers=["DATE","MERCHANT","DESCRIPTION","AMOUNT","CATEGORY","TYPE","DIRECTION"] + (["REVIEW"] if show_review else [])
+    widths=[15*mm,34*mm,38*mm,22*mm,31*mm,18*mm,14*mm] + ([12*mm] if show_review else [])
+    per_page=29
+    for start in range(0,len(txs),per_page):
+        chunk=txs[start:start+per_page]
+        story += [Spacer(1,4*mm),Paragraph(f"07 / CANONICAL LEDGER · {start//per_page+1}",ParagraphStyle("ledger_k",fontName="Helvetica-Bold",fontSize=7.5,textColor=colors.HexColor("#7C5CFC"))),Paragraph("Complete transaction ledger",styles["heading"]),Paragraph("Every supplied canonical transaction is preserved once. Repeated merchant names remain when the underlying transaction is different.",styles["small"]),Spacer(1,3*mm)]
+        rows=[[Paragraph(h,styles["table_head"]) for h in ledger_headers]]
+        for t in chunk:
+            date=getattr(t,"transaction_date",None); direction=_enum(getattr(t,"direction",None)) or "Debit"; amount=abs(_n(getattr(t,"original_amount",0)))
+            amount_text=("+" if direction.lower()=="credit" else "-")+f"{amount:,.2f}"
+            row=[Paragraph(date.strftime("%d %b") if date else "-",styles["table"]),Paragraph(escape(_merchant_name(t)),styles["table"]),Paragraph(escape(_safe_text(getattr(t,"description_raw",None))),styles["table"]),Paragraph(amount_text,styles["table_right"]),Paragraph(escape(_cat_name(t)),styles["table"]),Paragraph(escape(_safe_text(getattr(t,"transaction_type",None))),styles["table"]),Paragraph(escape(direction),styles["table"])]
+            if show_review: row.append(Paragraph("Yes" if getattr(t,"requires_review",False) else "No",styles["table"]))
+            rows.append(row)
+        tbl=Table(rows,colWidths=widths,repeatRows=1,splitByRow=1)
+        tbl.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#0B1220")),("BOX",(0,0),(-1,-1),.45,colors.HexColor("#E3E7EF")),("INNERGRID",(0,0),(-1,-1),.25,colors.HexColor("#E3E7EF")),("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#FAFBFD")]),("VALIGN",(0,0),(-1,-1),"MIDDLE"),("LEFTPADDING",(0,0),(-1,-1),3),("RIGHTPADDING",(0,0),(-1,-1),3),("TOPPADDING",(0,0),(-1,-1),3.2),("BOTTOMPADDING",(0,0),(-1,-1),3.2)]))
+        story.append(tbl)
+        if start+per_page>=len(txs):
+            story += [Spacer(1,3*mm),Paragraph("Ledger rule: only exact duplicate source records are candidates for deduplication. Different transactions from the same merchant are intentionally retained.",styles["small"])]
+        story.append(PageBreak())
 
-    # Keep the trend chart together on its own page so its heading never
-    # gets stranded at the bottom of the previous page.
+    # Final logic page
+    story += [Spacer(1,4*mm),Paragraph("08 / REPORT LOGIC",ParagraphStyle("kick8",fontName="Helvetica-Bold",fontSize=7.5,textColor=colors.HexColor("#7C5CFC"))),Paragraph("One story, one source of truth",styles["heading"]),Paragraph("The final report separates decision-making from evidence while preserving the complete transaction set.",styles["small"]),Spacer(1,4*mm)]
+    rules=[("EXECUTIVE","Balances, limit, utilization and statement-level read."),("SPENDING MAP","One visual composition of total outgoing spend."),("MONEY FLOW","Opening → spending → payments → closing."),("BEHAVIOUR","Value vs transaction frequency."),("MERCHANTS","Concentration and repeated activity."),("TREND","Weekly spending versus payments/credits."),("INTELLIGENCE","Reconciliation plus concise Finora signals."),("LEDGER",f"All {len(txs):,} supplied canonical transactions, once.")]
+    rt=Table([[Paragraph(f"<b>{a}</b>",styles["small"]),Paragraph(b,styles["body"])] for a,b in rules],colWidths=[42*mm,124*mm])
+    rt.setStyle(TableStyle([("BOX",(0,0),(-1,-1),.5,colors.HexColor("#E3E7EF")),("INNERGRID",(0,0),(-1,-1),.3,colors.HexColor("#E3E7EF")),("ROWBACKGROUNDS",(0,0),(-1,-1),[colors.white,colors.HexColor("#FAFBFD")]),("LEFTPADDING",(0,0),(-1,-1),8),("RIGHTPADDING",(0,0),(-1,-1),8),("TOPPADDING",(0,0),(-1,-1),8),("BOTTOMPADDING",(0,0),(-1,-1),8)]))
+    story += [rt,Spacer(1,10*mm)]
+    endbox=Table([[Paragraph("FINORA AI",ParagraphStyle("endbrand",fontName="Helvetica-Bold",fontSize=19,textColor=colors.white,alignment=TA_CENTER)),Paragraph("Financial intelligence that is easy to scan, easy to verify, and difficult to misunderstand.",ParagraphStyle("endcopy",fontName="Helvetica",fontSize=9.2,leading=13,textColor=colors.HexColor("#D5DBE7"),alignment=TA_CENTER))]],colWidths=[58*mm,108*mm])
+    endbox.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),colors.HexColor("#0B1220")),("VALIGN",(0,0),(-1,-1),"MIDDLE"),("LEFTPADDING",(0,0),(-1,-1),10),("RIGHTPADDING",(0,0),(-1,-1),10),("TOPPADDING",(0,0),(-1,-1),15),("BOTTOMPADDING",(0,0),(-1,-1),15)]))
+    story.append(endbox)
 
-    story_flow.append(PageBreak())
-    story_flow.append(Spacer(1, 4 * mm))
-    story_flow.append(Paragraph("Spending trend and repeated activity", styles["title"]))
-    story_flow.append(Paragraph(
-        "Weekly spending and payment activity, followed by merchants that appear repeatedly in the statement.",
-        styles["subtitle"],
-    ))
-    story_flow.append(Spacer(1, 2 * mm))
-
-    story_flow.append(Paragraph("Spending trend", styles["section"]))
-    if weekly:
-        story_flow.append(FinoraMiniBars(weekly, height=45 * mm))
-    else:
-        story_flow.append(Paragraph("Not enough dated transactions for a trend view.", styles["small"]))
-
-    story_flow.append(Paragraph("Repeated merchants", styles["section"]))
-    if repeated:
-        repeat_data = [[
-            Paragraph("MERCHANT", styles["table_head"]),
-            Paragraph("TRANSACTIONS", styles["table_head"]),
-            Paragraph("TOTAL", styles["table_head"]),
-        ]]
-        for merchant, count, amount in repeated[:8]:
-            repeat_data.append([
-                Paragraph(escape(merchant), styles["table_cell"]),
-                Paragraph(str(count), styles["table_cell_right"]),
-                Paragraph(_money(amount, currency), styles["table_cell_right"]),
-            ])
-        repeat_table = Table(repeat_data, colWidths=[160 * mm, 35 * mm, 45 * mm], repeatRows=1)
-        repeat_table.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), INDIGO),
-            ("BOX", (0, 0), (-1, -1), 0.5, GRID),
-            ("INNERGRID", (0, 0), (-1, -1), 0.3, GRID),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 5),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-            ("TOPPADDING", (0, 0), (-1, -1), 3),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-        ]))
-        story_flow.append(repeat_table)
-    else:
-        story_flow.append(Paragraph("No merchants appeared more than once in the finalized debit set.", styles["small"]))
-
-    # ========================================================
-    # PAGE 4 - RECONCILIATION + REVIEW + LARGEST TRANSACTIONS
-    # ========================================================
-    story_flow.append(PageBreak())
-    story_flow.append(Spacer(1, 4 * mm))
-    story_flow.append(Paragraph("Reconciliation and review", styles["title"]))
-    story_flow.append(Paragraph(
-        "Finora uses the supplied statement metadata where available and compares it with the extracted transaction flow.",
-        styles["subtitle"],
-    ))
-    story_flow.append(Spacer(1, 2 * mm))
-
-    if credit_card and opening_balance is not None and current_balance is not None:
-        calc_balance = opening_balance + expenses - income
-        difference = calc_balance - current_balance
-        recon_title = "CREDIT-CARD RECONCILIATION"
-        recon_text = (
-            f"Opening balance {_money(opening_balance, currency)} + purchases {_money(expenses, currency)} "
-            f"- payments/credits {_money(income, currency)} = calculated current balance {_money(calc_balance, currency)}."
-        )
-    else:
-        closing_balance = _metadata_number(metadata, "closing_balance")
-        opening_bank = _metadata_number(metadata, "opening_balance")
-        calc_balance = (opening_bank + income - expenses) if opening_bank is not None else None
-        difference = (calc_balance - closing_balance) if calc_balance is not None and closing_balance is not None else None
-        recon_title = "STATEMENT RECONCILIATION"
-        recon_text = (
-            f"Opening balance {_money(opening_bank, currency)} + received {_money(income, currency)} "
-            f"- spent {_money(expenses, currency)} = calculated closing balance {_money(calc_balance, currency)}."
-            if calc_balance is not None
-            else "No statement opening/closing balance pair was supplied for a full reconciliation."
-        )
-
-    if difference is not None:
-        recon_status = "Reconciled" if abs(difference) < 0.01 else f"Difference {_money(abs(difference), currency)}"
-        recon_color = GREEN if abs(difference) < 0.01 else AMBER
-    else:
-        recon_status = "Not available"
-        recon_color = MUTED
-
-    recon_box = Table([
-        [
-            Paragraph(recon_title, styles["metric_label"]),
-            Paragraph(recon_status, styles["metric_value_small"]),
-        ],
-        [Paragraph(recon_text, styles["insight"]), ""],
-    ], colWidths=[70 * mm, 170 * mm], hAlign="LEFT")
-    recon_box.setStyle(TableStyle([
-        ("SPAN", (0, 1), (1, 1)),
-        ("BACKGROUND", (0, 0), (-1, -1), SOFT),
-        ("BOX", (0, 0), (-1, -1), 0.6, GRID),
-        ("INNERGRID", (0, 0), (-1, -1), 0.3, GRID),
-        ("TEXTCOLOR", (1, 0), (1, 0), recon_color),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 8),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-        ("TOPPADDING", (0, 0), (-1, -1), 6),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-    ]))
-    story_flow.append(recon_box)
-    story_flow.append(Spacer(1, 3.5 * mm))
-
-    review_text = (
-        f"{review_count:,} transaction(s) are currently flagged for review. "
-        f"Category coverage is {category_coverage:.0f}% based on meaningful categories among {outgoing_count:,} outgoing transactions. "
-        "Category assignments reflect the current finalized Finora transaction data."
-    )
-    story_flow.append(Paragraph("Review signals", styles["section"]))
-    story_flow.append(_box_table(
-        [[Paragraph(review_text, styles["insight"])]],
-        [240 * mm],
-        padding=8,
-        background=INDIGO_LIGHT,
-    ))
-
-    story_flow.append(Paragraph("Largest transactions", styles["section"]))
-    largest_data = [[
-        Paragraph("DATE", styles["table_head"]),
-        Paragraph("MERCHANT", styles["table_head"]),
-        Paragraph("DIRECTION", styles["table_head"]),
-        Paragraph("AMOUNT", styles["table_head"]),
-        Paragraph("CATEGORY", styles["table_head"]),
-    ]]
-    for tx in largest:
-        d = getattr(tx, "transaction_date", None)
-        date_text = d.isoformat() if d else "-"
-        direction = _enum(getattr(tx, "direction", None))
-        largest_data.append([
-            Paragraph(escape(date_text), styles["table_cell"]),
-            Paragraph(escape(_merchant_name(tx)), styles["table_cell"]),
-            Paragraph(escape(direction), styles["table_cell"]),
-            Paragraph(_money(getattr(tx, "original_amount", 0), currency), styles["table_cell_right"]),
-            Paragraph(escape(_cat_name(tx)), styles["table_cell"]),
-        ])
-    largest_table = Table(largest_data, colWidths=[30 * mm, 95 * mm, 30 * mm, 40 * mm, 45 * mm], repeatRows=1)
-    largest_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), NAVY),
-        ("BOX", (0, 0), (-1, -1), 0.5, GRID),
-        ("INNERGRID", (0, 0), (-1, -1), 0.3, GRID),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 4),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-        ("TOPPADDING", (0, 0), (-1, -1), 3),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-    ]))
-    story_flow.append(largest_table)
-
-    # ========================================================
-    # PAGE 5+ - COMPLETE LEDGER
-    # ========================================================
-    story_flow.append(PageBreak())
-    story_flow.append(Spacer(1, 3 * mm))
-    story_flow.append(Paragraph("Complete transaction ledger", styles["title"]))
-    story_flow.append(Paragraph(
-        "Every extracted transaction is included below. Categories and review status reflect the current Finora transaction data.",
-        styles["subtitle"],
-    ))
-    story_flow.append(Spacer(1, 2.5 * mm))
-
-    ledger_head = [
-        Paragraph("DATE", styles["table_head"]),
-        Paragraph("MERCHANT", styles["table_head"]),
-        Paragraph("DESCRIPTION", styles["table_head"]),
-        Paragraph("AMOUNT", styles["table_head"]),
-        Paragraph("CURRENCY", styles["table_head"]),
-        Paragraph("DIRECTION", styles["table_head"]),
-        Paragraph("TYPE", styles["table_head"]),
-        Paragraph("CATEGORY", styles["table_head"]),
-        Paragraph("CONF.", styles["table_head"]),
-        Paragraph("REVIEW", styles["table_head"]),
-    ]
-    ledger_rows = [ledger_head]
-    for tx in txs:
-        date_value = getattr(tx, "transaction_date", None)
-        date_text = date_value.isoformat() if date_value else "-"
-        confidence = _n(getattr(tx, "extraction_confidence", 0)) * 100
-        review = "Yes" if getattr(tx, "requires_review", False) else "No"
-        direction = _enum(getattr(tx, "direction", None))
-        tx_type = _enum(getattr(tx, "transaction_type", None))
-        ledger_rows.append([
-            Paragraph(escape(date_text), styles["table_cell"]),
-            Paragraph(escape(_merchant_name(tx)), styles["table_cell"]),
-            Paragraph(escape(_safe_text(getattr(tx, "description_raw", None))), styles["table_cell"]),
-            Paragraph(f"{_n(getattr(tx, 'original_amount', 0)):,.2f}", styles["table_cell_right"]),
-            Paragraph(escape(_safe_text(getattr(tx, "original_currency", None), currency)), styles["table_cell"]),
-            Paragraph(escape(direction), styles["table_cell"]),
-            Paragraph(escape(tx_type), styles["table_cell"]),
-            Paragraph(escape(_cat_name(tx)), styles["table_cell"]),
-            Paragraph(f"{confidence:.1f}%", styles["table_cell_right"]),
-            Paragraph(review, styles["table_cell"]),
-        ])
-
-    ledger = Table(
-        ledger_rows,
-        colWidths=[22 * mm, 34 * mm, 64 * mm, 23 * mm, 20 * mm, 20 * mm, 21 * mm, 31 * mm, 17 * mm, 13 * mm],
-        repeatRows=1,
-        splitByRow=1,
-        hAlign="LEFT",
-    )
-    ledger_style = [
-        ("BACKGROUND", (0, 0), (-1, 0), INDIGO),
-        ("BOX", (0, 0), (-1, -1), 0.5, GRID),
-        ("INNERGRID", (0, 0), (-1, -1), 0.3, GRID),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 3),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-        ("TOPPADDING", (0, 0), (-1, -1), 2.8),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 2.8),
-    ]
-    for row_index in range(1, len(ledger_rows)):
-        if row_index % 2 == 0:
-            ledger_style.append(
-                ("BACKGROUND", (0, row_index), (-1, row_index), colors.HexColor("#FBFCFE"))
-            )
-    ledger.setStyle(TableStyle(ledger_style))
-    story_flow.append(ledger)
-
-    doc.build(story_flow)
+    buffer=BytesIO()
+    doc=SimpleDocTemplate(buffer,pagesize=A4,leftMargin=18*mm,rightMargin=18*mm,topMargin=18*mm,bottomMargin=18*mm,title="Finora AI Financial Intelligence Report",author="Finora AI")
+    doc.build(story,onFirstPage=_c3_chrome,onLaterPages=_c3_chrome)
     return buffer.getvalue()
-
 
 def build_finora_report(
     transactions,

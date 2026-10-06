@@ -180,9 +180,29 @@ class OCRFallback:
         return max(scores, key=scores.get)
 
     def _open_pdf(self):
-        if self.password:
-            return pymupdf.open(self.file_path, password=self.password)
-        return pymupdf.open(self.file_path)
+        """Open the PDF and authenticate encrypted documents when needed.
+
+        PyMuPDF versions used by Finora do not accept ``password=`` in
+        ``pymupdf.open()``. The supported flow is to open the document first
+        and then call ``authenticate()`` when the document requires a password.
+        """
+        pdf = pymupdf.open(self.file_path)
+
+        if pdf.needs_pass:
+            if not self.password:
+                pdf.close()
+                raise ValueError(
+                    "This PDF is password protected. Please enter the PDF password."
+                )
+
+            authenticated = pdf.authenticate(self.password)
+            if not authenticated:
+                pdf.close()
+                raise ValueError(
+                    "Incorrect PDF password. Please enter the correct password and try again."
+                )
+
+        return pdf
 
     def _render_page(self, page) -> Image.Image:
         pix = page.get_pixmap(matrix=pymupdf.Matrix(self.OCR_SCALE, self.OCR_SCALE), alpha=False)

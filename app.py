@@ -1,8 +1,11 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
+from pathlib import Path
+from io import BytesIO
 import re
 import time
 import uuid
@@ -15,8 +18,9 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 
 from ingestion.pipeline import FinancialStatementPipeline
 from transactions.models import Transaction, TransactionDirection
@@ -25,6 +29,10 @@ from learning.category_memory import HybridCategoryEngine, CategoryMemory, merch
 from reports.financial_report import build_finora_report
 
 load_dotenv()
+
+from utils.observability import configure_logfire
+
+configure_logfire()
 
 st.set_page_config(
     page_title="Finora AI",
@@ -56,6 +64,10 @@ defaults = {
     "statement_id": None,
     "statement_source_path": None,
     "review_cursor": 0,
+    "merchant_analysis_granularity": "monthly",
+    "merchant_analysis_category": None,
+    "report_pdf_data": None,
+    "report_page": 1,
 }
 
 for key, value in defaults.items():
@@ -957,14 +969,14 @@ if not st.session_state.get("upload_mode", False):
 # Dashboard / Analytics / Upload Statement behind. If the value is not one
 # of the routes used by this version, recover to a real route instead of
 # rendering only the navigation bar.
-VALID_PAGES = {"Home", "Overview", "Transactions", "AI", "Review", "Upload"}
+VALID_PAGES = {"Home", "Overview", "Transactions", "AI", "Review", "Upload", "Merchant Analysis", "Report"}
 
 current_page = st.session_state.get("page")
 has_transactions = bool(st.session_state.get("transactions"))
 
 if requested_page == "Upload":
     st.session_state.page = "Home"
-elif requested_page in {"Overview", "Transactions", "AI", "Review"}:
+elif requested_page in {"Overview", "Transactions", "AI", "Review", "Merchant Analysis", "Report"}:
     st.session_state.page = requested_page
 elif current_page in {"Home", "Upload"} and has_transactions and not st.session_state.get("upload_mode", False):
     # A Streamlit reconnect can restore transactions from disk while the
@@ -4712,7 +4724,9 @@ with nav_brand:
 with nav_links:
     active = st.session_state.page
     active_label = "AI Intelligence" if active == "AI" else active
-    if active_label not in {"Overview", "Transactions", "AI Intelligence"}:
+    if active == "Report":
+        active_label = "Overview"
+    if active_label not in {"Overview", "Transactions", "AI Intelligence", "Merchant Analysis"}:
         active_label = "Overview"
 
     def nav_link(label, page):
@@ -4736,6 +4750,7 @@ with nav_links:
         <div class="finora-nav">
             {nav_link("Overview", "Overview")}
             {nav_link("Transactions", "Transactions")}
+            {nav_link("Merchant Analysis", "Merchant%20Analysis")}
             {nav_link("AI Intelligence", "AI")}
         </div>
         """)
@@ -5112,17 +5127,48 @@ def render_ai_assistant_page(transactions):
         </div>
         """)
         if credit_card_mode:
-            m1, m2 = st.columns(2)
+            # For credit cards, "card spent" is the total of all outgoing/debit
+            # transactions in the finalized statement. It is intentionally
+            # different from the current statement balance because payments
+            # and credits reduce the balance without reducing purchase spend.
+            card_spent = expenses
+
+            m1, m2, m3, m4, m5 = st.columns(5)
+
             with m1:
-                render(f"<div class='metric'><div class='metric-label'>CARD LIMIT</div><div class='metric-value'>{money(credit_card.get('card_limit', 0), currency)}</div><div class='metric-sub'>Credit limit on the statement</div></div>")
+                render(
+                    f"<div class='metric'><div class='metric-label'>CARD LIMIT</div>"
+                    f"<div class='metric-value'>{money(credit_card.get('card_limit', 0), currency)}</div>"
+                    f"<div class='metric-sub'>Maximum card limit</div></div>"
+                )
+
             with m2:
-                render(f"<div class='metric'><div class='metric-label'>CURRENT BALANCE</div><div class='metric-value'>{money(credit_card.get('current_balance', 0), currency)}</div><div class='metric-sub'>Outstanding card balance</div></div>")
-            st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
-            m3, m4 = st.columns(2)
+                render(
+                    f"<div class='metric'><div class='metric-label'>CARD SPENT</div>"
+                    f"<div class='metric-value'>{money(card_spent, currency)}</div>"
+                    f"<div class='metric-sub'>Total purchases / charges</div></div>"
+                )
+
             with m3:
-                render(f"<div class='metric'><div class='metric-label'>AVAILABLE CREDIT</div><div class='metric-value'>{money(credit_card.get('available_limit', 0), currency)}</div><div class='metric-sub'>Credit still available</div></div>")
+                render(
+                    f"<div class='metric'><div class='metric-label'>CURRENT BALANCE</div>"
+                    f"<div class='metric-value'>{money(credit_card.get('current_balance', 0), currency)}</div>"
+                    f"<div class='metric-sub'>Outstanding card balance</div></div>"
+                )
+
             with m4:
-                render(f"<div class='metric'><div class='metric-label'>TOTAL PAYMENT DUE</div><div class='metric-value'>{money(credit_card.get('total_payment_due', 0), currency)}</div><div class='metric-sub'>Due on {escape(str(credit_card.get('payment_due_date') or 'the statement due date'))}</div></div>")
+                render(
+                    f"<div class='metric'><div class='metric-label'>AVAILABLE CREDIT</div>"
+                    f"<div class='metric-value'>{money(credit_card.get('available_limit', 0), currency)}</div>"
+                    f"<div class='metric-sub'>Credit still available</div></div>"
+                )
+
+            with m5:
+                render(
+                    f"<div class='metric'><div class='metric-label'>TOTAL PAYMENT DUE</div>"
+                    f"<div class='metric-value'>{money(credit_card.get('total_payment_due', 0), currency)}</div>"
+                    f"<div class='metric-sub'>Due on {escape(str(credit_card.get('payment_due_date') or 'the statement due date'))}</div></div>"
+                )
         else:
             m1, m2 = st.columns(2)
             with m1:
@@ -5139,24 +5185,9 @@ def render_ai_assistant_page(transactions):
                 render(f"<div class='metric'><div class='metric-label'>CLOSING BALANCE</div><div class='metric-value'>{closing_text}</div><div class='metric-sub'>{closing_sub}</div></div>")
 
         st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-        render("""<div class="section-head"><div class="section-title">Where your money went</div><div class="section-subtitle">Ask Finora about any of these merchants.</div></div>""")
-        if not merchant_df.empty:
-            for _, row in merchant_df.head(8).iterrows():
-                name = escape(str(row["Merchant"]))
-                amount = number(row["Amount"])
-                pct = (amount / float(expenses) * 100) if float(expenses) else 0
-                render(f"""
-                <div style="padding:15px 0;border-bottom:1px solid #1d293b;">
-                    <div style="display:flex;justify-content:space-between;gap:16px;">
-                        <span style="font-size:1.05rem;font-weight:800;color:#f8fafc;">{name}</span>
-                        <span style="font-size:1.05rem;font-weight:800;color:#c7d2fe;">{money(amount, currency)}</span>
-                    </div>
-                    <div style="margin-top:8px;height:8px;background:#172238;border-radius:999px;overflow:hidden;"><div style="width:{min(pct,100):.1f}%;height:100%;background:#818cf8;border-radius:999px;"></div></div>
-                    <div style="margin-top:6px;font-size:.86rem;color:#94a3b8;">{pct:.1f}% of outgoing money</div>
-                </div>
-                """)
-        else:
-            st.info("Merchant spending data is not available yet.")
+
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+
         if not category_df.empty:
             st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
             render("<div class='section-title'>Spending by category</div>")
@@ -5641,28 +5672,1037 @@ def overview_category_icon(category_name):
     return overrides.get(name, icons.get(name, "📦"))
 
 
+# ============================================================
+# REPORT VIEWER PAGE
+# ============================================================
+
+def _build_live_report_pdf():
+    """Build the current Finora report from the live statement data."""
+    try:
+        return build_finora_report(
+            st.session_state.get("transactions") or [],
+            file_name=st.session_state.get("file_name"),
+            statement_metadata=get_statement_metadata(),
+        )
+    except Exception as exc:
+        print(f"Finora report viewer error: {exc}")
+        return None
+
+
+def _report_period_text(report_transactions):
+    """Return a readable statement period from current transaction dates."""
+    try:
+        frame = make_dataframe(report_transactions)
+        if frame.empty or "Date" not in frame.columns:
+            return "Statement period"
+        dates = pd.to_datetime(frame["Date"], errors="coerce").dropna()
+        if dates.empty:
+            return "Statement period"
+        return f"{dates.min():%d %b %Y} – {dates.max():%d %b %Y}"
+    except Exception:
+        return "Statement period"
+
+
+
+def _build_report_pdf_by_type(report_type, transactions):
+    """Build the selected report PDF.
+
+    Merchant Analysis intentionally mirrors the live Merchant Analysis screen:
+    category selector, selected-category KPI strip, spending trend, top merchants,
+    and merchant-share donut.  Overview continues to use the existing report
+    generator and Transactions continues to use the ledger layout.
+    """
+    report_type = str(report_type or "Overview").strip()
+
+    if report_type == "Overview":
+        return build_finora_report(
+            transactions or [],
+            file_name=st.session_state.get("file_name"),
+            statement_metadata=get_statement_metadata(),
+        )
+
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak,
+        Flowable,
+    )
+
+    frame = make_dataframe(transactions or [])
+    if frame is None:
+        frame = pd.DataFrame()
+    frame = frame.copy()
+
+    def col(name, fallback=""):
+        if name not in frame.columns:
+            return pd.Series([fallback] * len(frame), index=frame.index)
+        return frame[name]
+
+    frame["Date"] = pd.to_datetime(col("Date"), errors="coerce")
+    frame["Amount"] = pd.to_numeric(col("Amount"), errors="coerce").fillna(0.0).abs()
+    frame["Direction"] = col("Direction").fillna("").astype(str).str.strip().str.lower()
+    frame["Merchant"] = col("Merchant").fillna("").astype(str).str.strip()
+    frame["Description"] = col("Description").fillna("").astype(str).str.strip()
+    frame["Category"] = col("Category", "Uncategorized").fillna("Uncategorized").astype(str).str.strip()
+    frame["Currency"] = col("Currency", "").fillna("").astype(str).str.strip()
+    frame["Type"] = col("Type", "").fillna("").astype(str).str.strip()
+    frame["Confidence"] = pd.to_numeric(col("Confidence"), errors="coerce")
+    frame["Review"] = col("Review", "No").fillna("No").astype(str)
+    frame["Merchant"] = frame["Merchant"].where(frame["Merchant"] != "", frame["Description"])
+    frame["Merchant"] = frame["Merchant"].where(frame["Merchant"] != "", "Unknown merchant")
+
+    currencies = [x.upper() for x in frame["Currency"].tolist() if x]
+    currency = max(set(currencies), key=currencies.count) if currencies else "AED"
+    period = _report_period_text(transactions)
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "FinoraReportTypeTitle", parent=styles["Title"], fontName="Helvetica-Bold",
+        fontSize=21, leading=24, textColor=colors.HexColor("#F8FAFC"),
+        alignment=TA_LEFT, spaceAfter=3,
+    )
+    subtitle_style = ParagraphStyle(
+        "FinoraReportTypeSubtitle", parent=styles["Normal"], fontName="Helvetica",
+        fontSize=8.2, leading=10, textColor=colors.HexColor("#94A3B8"),
+    )
+    section_style = ParagraphStyle(
+        "FinoraReportTypeSection", parent=styles["Heading2"], fontName="Helvetica-Bold",
+        fontSize=10.5, leading=13, textColor=colors.HexColor("#F8FAFC"), spaceAfter=4,
+    )
+    small_style = ParagraphStyle(
+        "FinoraReportTypeSmall", parent=styles["Normal"], fontName="Helvetica",
+        fontSize=6.5, leading=8, textColor=colors.HexColor("#94A3B8"),
+    )
+    body_style = ParagraphStyle(
+        "FinoraReportTypeBody", parent=styles["Normal"], fontName="Helvetica",
+        fontSize=7.2, leading=9, textColor=colors.HexColor("#E2E8F0"),
+    )
+    value_style = ParagraphStyle(
+        "FinoraReportTypeValue", parent=styles["Normal"], fontName="Helvetica-Bold",
+        fontSize=13, leading=15, textColor=colors.HexColor("#F8FAFC"),
+    )
+    label_style = ParagraphStyle(
+        "FinoraReportTypeLabel", parent=styles["Normal"], fontName="Helvetica-Bold",
+        fontSize=5.4, leading=6.5, textColor=colors.HexColor("#64748B"),
+        letterSpacing=0.8,
+    )
+    table_head = ParagraphStyle(
+        "FinoraReportTypeHead", parent=styles["Normal"], fontName="Helvetica-Bold",
+        fontSize=6.4, leading=7.5, textColor=colors.white,
+    )
+    table_cell = ParagraphStyle(
+        "FinoraReportTypeCell", parent=styles["Normal"], fontName="Helvetica",
+        fontSize=6.2, leading=7.4, textColor=colors.HexColor("#E2E8F0"),
+    )
+
+    bg = colors.HexColor("#070C16")
+    panel = colors.HexColor("#0B1220")
+    panel2 = colors.HexColor("#0E1726")
+    border = colors.HexColor("#24344F")
+    muted = colors.HexColor("#64748B")
+    text = colors.HexColor("#F8FAFC")
+    purple = colors.HexColor("#6366F1")
+    purple2 = colors.HexColor("#8B5CF6")
+    pink = colors.HexColor("#E15D82")
+    orange = colors.HexColor("#F3A56B")
+    yellow = colors.HexColor("#E9C75A")
+    green = colors.HexColor("#72C6A0")
+    blue = colors.HexColor("#6FA0E5")
+    lavender = colors.HexColor("#8B82E8")
+
+    buffer = BytesIO()
+    page_size = landscape(A4) if report_type == "Merchant Analysis" else landscape(A4)
+    doc = SimpleDocTemplate(
+        buffer, pagesize=page_size,
+        leftMargin=10 * mm, rightMargin=10 * mm,
+        topMargin=10 * mm, bottomMargin=10 * mm,
+        title=f"Finora AI {report_type} Report",
+        author="Finora AI",
+    )
+
+    def chrome(canvas, doc_obj):
+        canvas.saveState()
+        canvas.setFillColor(bg)
+        canvas.rect(0, 0, page_size[0], page_size[1], fill=1, stroke=0)
+        canvas.setFillColor(purple)
+        canvas.roundRect(10*mm, page_size[1]-19*mm, 9*mm, 7*mm, 1.8*mm, fill=1, stroke=0)
+        canvas.setFillColor(colors.white)
+        canvas.setFont("Helvetica-Bold", 9)
+        canvas.drawCentredString(14.5*mm, page_size[1]-17*mm, "F")
+        canvas.setFillColor(text)
+        canvas.setFont("Helvetica-Bold", 9)
+        canvas.drawString(22*mm, page_size[1]-17*mm, "Finora AI")
+        canvas.setFillColor(muted)
+        canvas.setFont("Helvetica", 6.8)
+        canvas.drawRightString(page_size[0]-10*mm, page_size[1]-17*mm, "Merchant Intelligence Report")
+        canvas.setStrokeColor(border)
+        canvas.line(10*mm, 9*mm, page_size[0]-10*mm, 9*mm)
+        canvas.setFillColor(muted)
+        canvas.setFont("Helvetica", 6.2)
+        canvas.drawString(10*mm, 5.5*mm, "FINORA AI - Turn financial statements into financial intelligence.")
+        canvas.drawRightString(page_size[0]-10*mm, 5.5*mm, f"Page {doc_obj.page}")
+        canvas.restoreState()
+
+    if report_type == "Merchant Analysis":
+        debit = frame[frame["Direction"] == "debit"].copy()
+        if debit.empty:
+            story = [Spacer(1, 25*mm), Paragraph("Merchant Analysis", title_style), Paragraph("No outgoing transactions are available.", subtitle_style)]
+            doc.build(story, onFirstPage=chrome)
+            return buffer.getvalue()
+
+        # IMPORTANT: The Merchant Analysis export contains EVERY spending
+        # category, not only the category currently selected in the live UI.
+        # Each category gets the same dashboard-style analysis shown on the
+        # Merchant Analysis screen, on its own PDF page.
+        category_summary = (
+            debit.groupby("Category", as_index=False)["Amount"].sum()
+            .sort_values(["Amount", "Category"], ascending=[False, True])
+            .reset_index(drop=True)
+        )
+        categories = category_summary["Category"].astype(str).tolist()
+        preferred = ["Food & Dining", "Groceries", "Transportation", "Shopping", "Bills & Utilities", "Healthcare"]
+        ordered_categories = [c for c in preferred if c in categories]
+        ordered_categories += [c for c in categories if c not in ordered_categories]
+
+        total_statement_spending = float(debit["Amount"].sum())
+        story = []
+
+        class MerchantPanels(Flowable):
+            def __init__(self, monthly_rows, top_rows, total, currency_code):
+                super().__init__()
+                self.width = 267*mm
+                self.height = 92*mm
+                self.monthly_rows = monthly_rows
+                self.top_rows = top_rows
+                self.total = total
+                self.currency_code = currency_code
+
+            def draw(self):
+                c = self.canv
+                x0 = 0
+                y0 = 0
+                h = self.height
+                gap = 4*mm
+                widths = [87*mm, 87*mm, 89*mm]
+                xs = [x0, widths[0]+gap, widths[0]+gap+widths[1]+gap]
+
+                for x, w in zip(xs, widths):
+                    c.setFillColor(panel)
+                    c.setStrokeColor(border)
+                    c.roundRect(x, y0, w, h, 3*mm, fill=1, stroke=1)
+
+                # Spending trend panel
+                c.setFillColor(text)
+                c.setFont("Helvetica-Bold", 9.5)
+                c.drawString(xs[0]+5*mm, h-9*mm, "⌁ Spending Trend")
+                c.setFillColor(muted)
+                c.setFont("Helvetica", 6.1)
+                c.drawString(xs[0]+5*mm, h-14*mm, "Spending and transaction activity over time")
+
+                # Top merchants panel
+                c.setFillColor(text)
+                c.setFont("Helvetica-Bold", 9.5)
+                c.drawString(xs[1]+5*mm, h-9*mm, "▤ Top Merchants")
+                c.setFillColor(muted)
+                c.setFont("Helvetica", 6.1)
+                c.drawRightString(xs[1]+widths[1]-5*mm, h-9*mm, f"{sum(r[2] for r in self.top_rows)} txns")
+
+                # Merchant share panel
+                c.setFillColor(text)
+                c.setFont("Helvetica-Bold", 9.5)
+                c.drawString(xs[2]+5*mm, h-9*mm, "◔ Merchant Share")
+                c.setFillColor(muted)
+                c.setFont("Helvetica", 6.1)
+                c.drawString(xs[2]+5*mm, h-14*mm, "How this category is split across merchants.")
+
+                # Trend chart
+                chart_x = xs[0]+10*mm
+                chart_y = 16*mm
+                chart_w = 68*mm
+                chart_h = 52*mm
+                if self.monthly_rows:
+                    max_sp = max(r[1] for r in self.monthly_rows) or 1
+                    max_tx = max(r[2] for r in self.monthly_rows) or 1
+                    c.setStrokeColor(colors.HexColor("#1E293B"))
+                    for i in range(4):
+                        yy = chart_y + i*chart_h/3
+                        c.line(chart_x, yy, chart_x+chart_w, yy)
+                    pts = []
+                    for i, r in enumerate(self.monthly_rows):
+                        xx = chart_x + (i+0.5)*chart_w/max(1, len(self.monthly_rows))
+                        bh = (r[1]/max_sp)*chart_h
+                        c.setFillColor(pink)
+                        c.rect(xx-5*mm, chart_y, 10*mm, bh, fill=1, stroke=0)
+                        py = chart_y + (r[2]/max_tx)*chart_h
+                        pts.append((xx, py))
+                        c.setFillColor(muted)
+                        c.setFont("Helvetica", 5.5)
+                        c.drawCentredString(xx, chart_y-4*mm, r[0].strftime("%b"))
+                    if len(pts) > 1:
+                        c.setStrokeColor(lavender)
+                        c.setLineWidth(1.2)
+                        for a, b in zip(pts, pts[1:]):
+                            c.line(a[0], a[1], b[0], b[1])
+                    for px, py in pts:
+                        c.setFillColor(lavender)
+                        c.circle(px, py, 1.1*mm, fill=1, stroke=0)
+
+                # Top merchants bars
+                base_y = h-26*mm
+                max_amt = max((r[1] for r in self.top_rows), default=1) or 1
+                for i, (name, amt, count, share) in enumerate(self.top_rows):
+                    yy = base_y-i*12*mm
+                    c.setFillColor(colors.HexColor("#1B2740"))
+                    c.roundRect(xs[1]+11*mm, yy-2*mm, 58*mm, 1.5*mm, .7*mm, fill=1, stroke=0)
+                    c.setFillColor(purple2)
+                    c.roundRect(xs[1]+11*mm, yy-2*mm, 58*mm*(amt/max_amt), 1.5*mm, .7*mm, fill=1, stroke=0)
+                    c.setFillColor(muted)
+                    c.setFont("Helvetica-Bold", 5.8)
+                    c.drawString(xs[1]+5*mm, yy-2*mm, f"{i+1:02d}")
+                    c.setFillColor(text)
+                    c.setFont("Helvetica", 6.7)
+                    c.drawCentredString(xs[1]+44*mm, yy+2.5*mm, str(name)[:24])
+                    c.setFont("Helvetica-Bold", 6.4)
+                    c.drawRightString(xs[1]+widths[1]-5*mm, yy+2.5*mm, f"{self.currency_code} {amt:,.2f}")
+                    c.setFillColor(muted)
+                    c.setFont("Helvetica", 5.6)
+                    c.drawRightString(xs[1]+widths[1]-5*mm, yy-4.5*mm, f"{count} · {share:.1f}%")
+
+                # Donut + legend
+                cx = xs[2]+25*mm
+                cy = 39*mm
+                radius = 19*mm
+                inner = 10*mm
+                palette = [pink, orange, yellow, green, blue, lavender]
+                rows = self.top_rows[:5]
+                used = sum(r[1] for r in rows)
+                other = max(0, self.total-used)
+                vals = [r[1] for r in rows] + ([other] if other > 0 else [])
+                labels = [r[0] for r in rows] + (["Others"] if other > 0 else [])
+                start_angle = 90
+                for i, v in enumerate(vals):
+                    extent = 360*(v/self.total) if self.total else 0
+                    c.setFillColor(palette[i % len(palette)])
+                    c.wedge(cx-radius, cy-radius, cx+radius, cy+radius,
+                            start_angle-extent, start_angle, fill=1, stroke=0)
+                    start_angle -= extent
+                c.setFillColor(panel)
+                c.circle(cx, cy, inner, fill=1, stroke=0)
+                c.setFillColor(muted)
+                c.setFont("Helvetica", 5.5)
+                c.drawCentredString(cx, cy+2*mm, self.currency_code)
+                c.setFillColor(text)
+                c.setFont("Helvetica-Bold", 7.8)
+                c.drawCentredString(cx, cy-2.5*mm, f"{self.total:,.2f}")
+                lx = xs[2]+49*mm
+                ly = h-27*mm
+                for i, (lab, v) in enumerate(zip(labels, vals)):
+                    yy = ly-i*10*mm
+                    c.setFillColor(palette[i % len(palette)])
+                    c.circle(lx, yy, 1.1*mm, fill=1, stroke=0)
+                    c.setFillColor(text)
+                    c.setFont("Helvetica", 6.2)
+                    c.drawString(lx+4*mm, yy-1.5*mm, str(lab)[:21])
+                    c.setFillColor(muted)
+                    c.drawRightString(xs[2]+widths[2]-5*mm, yy-1.5*mm,
+                                      f"{v/self.total*100:.1f}%" if self.total else "0.0%")
+
+        for category_index, selected in enumerate(ordered_categories):
+            selected_df = debit[debit["Category"] == selected].copy()
+            selected_total = float(selected_df["Amount"].sum())
+            selected_count = len(selected_df)
+            selected_share = selected_total / total_statement_spending * 100 if total_statement_spending else 0
+            selected_avg = selected_total / selected_count if selected_count else 0
+
+            merchants = (
+                selected_df.groupby("Merchant", as_index=False)["Amount"].sum()
+                .sort_values("Amount", ascending=False)
+            )
+            merchant_counts = selected_df["Merchant"].value_counts()
+            merchants["Count"] = merchants["Merchant"].map(merchant_counts).fillna(0).astype(int)
+            merchants["Share"] = merchants["Amount"] / selected_total * 100 if selected_total else 0
+            top = merchants.head(5).copy()
+
+            selected_df["MonthSort"] = selected_df["Date"].dt.to_period("M")
+            monthly = (
+                selected_df.dropna(subset=["MonthSort"])
+                .groupby("MonthSort")
+                .agg(spending=("Amount", "sum"), transactions=("Amount", "size"))
+                .reset_index()
+                .sort_values("MonthSort")
+                .tail(6)
+            )
+
+            if category_index > 0:
+                story.append(PageBreak())
+
+            story += [
+                Spacer(1, 8*mm),
+                Paragraph("Merchant Analysis", title_style),
+                Paragraph(
+                    f"See how your spending is distributed across merchants in each category.  {escape(period)} · {escape(currency)}",
+                    subtitle_style,
+                ),
+                Spacer(1, 3*mm),
+            ]
+
+            # Show ALL category chips on every category page. The active chip
+            # identifies which category's detailed dashboard is below.
+            chip_cells = [Paragraph("▦  ALL CATEGORIES", ParagraphStyle(
+                f"ChipLabel{category_index}", parent=small_style, fontName="Helvetica-Bold",
+                fontSize=6.2, textColor=text, leading=8))]
+            for chip_index, category_name in enumerate(ordered_categories):
+                amount_row = category_summary[category_summary["Category"] == category_name]
+                amount = float(amount_row["Amount"].iloc[0]) if not amount_row.empty else 0.0
+                active = category_name == selected
+                chip_cells.append(Paragraph(
+                    f"{category_name}  {currency} {amount:,.0f}",
+                    ParagraphStyle(
+                        f"Chip{category_index}_{chip_index}", parent=small_style,
+                        fontName="Helvetica-Bold", fontSize=5.55,
+                        textColor=colors.white if active else colors.HexColor("#CBD5E1"),
+                        leading=6.7,
+                    ),
+                ))
+
+            # Keep the selector readable even when a statement has many categories.
+            max_chip_categories = min(len(ordered_categories), 8)
+            chip_cells = chip_cells[:1 + max_chip_categories]
+            chip_widths = [31*mm] + [30*mm] * (len(chip_cells)-1)
+            chip = Table([chip_cells], colWidths=chip_widths, rowHeights=[13*mm])
+            chip_style = [
+                ("BACKGROUND", (0,0), (-1,-1), panel2),
+                ("BOX", (0,0), (-1,-1), .5, border),
+                ("INNERGRID", (0,0), (-1,-1), .4, border),
+                ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+                ("LEFTPADDING", (0,0), (-1,-1), 4),
+                ("RIGHTPADDING", (0,0), (-1,-1), 4),
+            ]
+            active_positions = [i+1 for i, c in enumerate(ordered_categories[:max_chip_categories]) if c == selected]
+            if active_positions:
+                chip_style.append(("BACKGROUND", (active_positions[0],0), (active_positions[0],0), purple))
+            chip.setStyle(TableStyle(chip_style))
+            story += [chip, Spacer(1, 3.5*mm)]
+
+            summary = Table([[
+                Paragraph(selected, ParagraphStyle(f"CatName{category_index}", parent=value_style, fontSize=11.5, textColor=text)),
+                Paragraph("SPENDING", label_style), Paragraph(f"{currency} {selected_total:,.2f}", value_style),
+                Paragraph("TRANSACTIONS", label_style), Paragraph(f"{selected_count:,}", value_style),
+                Paragraph("AVERAGE", label_style), Paragraph(f"{currency} {selected_avg:,.2f}", value_style),
+                Paragraph("SHARE", label_style), Paragraph(f"{selected_share:.1f}%", value_style),
+            ]], colWidths=[62*mm, 24*mm, 39*mm, 25*mm, 25*mm, 22*mm, 35*mm, 18*mm, 25*mm])
+            summary.setStyle(TableStyle([
+                ("BACKGROUND", (0,0), (-1,-1), panel), ("BOX", (0,0), (-1,-1), .6, border),
+                ("VALIGN", (0,0), (-1,-1), "MIDDLE"), ("LEFTPADDING", (0,0), (-1,-1), 5),
+                ("RIGHTPADDING", (0,0), (-1,-1), 5), ("TOPPADDING", (0,0), (-1,-1), 5),
+                ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+            ]))
+            story += [summary, Spacer(1, 4*mm)]
+
+            monthly_rows = [(r["MonthSort"], float(r["spending"]), int(r["transactions"])) for _, r in monthly.iterrows()]
+            top_rows = [(str(r["Merchant"]), float(r["Amount"]), int(r["Count"]), float(r["Share"])) for _, r in top.iterrows()]
+            story.append(MerchantPanels(monthly_rows, top_rows, selected_total, currency))
+            story += [
+                Spacer(1, 3*mm),
+                Paragraph(
+                    f"Category {category_index + 1} of {len(ordered_categories)}: {escape(selected)} · "
+                    f"{selected_count:,} transactions · {currency} {selected_total:,.2f} total · "
+                    f"{selected_share:.1f}% of statement spending.",
+                    small_style,
+                ),
+            ]
+
+        doc.build(story, onFirstPage=chrome, onLaterPages=chrome)
+        return buffer.getvalue()
+
+    # Transactions report (kept functional and intentionally unchanged in spirit).
+    story = [Spacer(1, 8*mm), Paragraph(f"Finora AI — Transactions Report", title_style), Paragraph(
+        f"{escape(str(st.session_state.get('file_name') or 'Financial statement'))} · {escape(period)} · {escape(currency)}", subtitle_style), Spacer(1, 3*mm)]
+    rows = [[Paragraph(x, table_head) for x in ["DATE","MERCHANT","DESCRIPTION","AMOUNT","CURRENCY","DIRECTION","TYPE","CATEGORY","CONF.","REVIEW"]]]
+    ordered = frame.sort_values(["Date", "Merchant"], na_position="last")
+    for _, r in ordered.iterrows():
+        dt = r["Date"].strftime("%Y-%m-%d") if pd.notna(r["Date"]) else "-"
+        conf = f"{float(r['Confidence']):.1f}%" if pd.notna(r["Confidence"]) else "-"
+        rows.append([Paragraph(str(v), table_cell) for v in [dt,str(r["Merchant"]),str(r["Description"]),f"{float(r['Amount']):,.2f}",str(r["Currency"]),str(r["Direction"]),str(r["Type"]),str(r["Category"]),conf,str(r["Review"])]] )
+    table = Table(rows, colWidths=[22*mm,38*mm,66*mm,25*mm,20*mm,21*mm,23*mm,34*mm,20*mm,15*mm], repeatRows=1, splitByRow=1)
+    table.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),purple),("BOX",(0,0),(-1,-1),.5,border),("INNERGRID",(0,0),(-1,-1),.3,border),("ROWBACKGROUNDS",(0,1),(-1,-1),[panel,colors.HexColor("#0E1726")]),("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
+    story += [table]
+    doc.build(story, onFirstPage=chrome)
+    return buffer.getvalue()
+
+
+REPORT_PDF_VERSION = "concept3-final-v3"
+
+def _build_full_combined_report_pdf(transactions):
+    """Return the one canonical Concept 3 Finora report PDF.
+
+    The Concept 3 financial_report generator already contains the complete
+    customer-facing report, including the canonical ledger.  The previous
+    implementation appended the legacy Merchant Analysis and Transactions
+    exports, which produced the unwanted extra category-by-category pages.
+
+    The full download MUST be identical to the PDF shown in the report viewer.
+    """
+    txs = list(transactions or [])
+    if not txs:
+        raise ValueError("There are no transactions available for the complete report.")
+
+    pdf_bytes = build_finora_report(
+        txs,
+        file_name=st.session_state.get("file_name"),
+        statement_metadata=get_statement_metadata(),
+    )
+    if not isinstance(pdf_bytes, (bytes, bytearray)) or not pdf_bytes:
+        raise ValueError("Finora report generator did not return valid PDF bytes.")
+
+    pdf_bytes = bytes(pdf_bytes)
+    try:
+        reader = PdfReader(BytesIO(pdf_bytes))
+        if len(reader.pages) < 1:
+            raise ValueError("PDF contains no pages.")
+    except Exception as exc:
+        raise ValueError(f"The Finora report could not be validated: {exc}") from exc
+
+    return pdf_bytes
+
+
+def render_report_viewer_page(transactions):
+    """
+    Finora PDF report viewer.
+
+    IMPORTANT:
+    - The generated PDF bytes are written to a real local PDF file.
+    - The browser preview uses Streamlit's PDF iframe handling for that file.
+    - No data:application/pdf URL is used.
+    - No viewer HTML is passed through the PDF generator.
+    - The HTML toolbar is rendered by Streamlit itself, so it cannot appear
+      as literal HTML text inside the PDF preview.
+    """
+    report_type = st.session_state.get("report_type", "Overview")
+    if report_type not in {"Overview", "Merchant Analysis", "Transactions"}:
+        report_type = "Overview"
+        st.session_state.report_type = report_type
+
+    cached_version = st.session_state.get("report_pdf_version")
+    report_pdf = (
+        st.session_state.get("report_pdf_data")
+        if cached_version == REPORT_PDF_VERSION
+        else None
+    )
+
+    if not report_pdf:
+        report_pdf = _build_report_pdf_by_type(report_type, transactions)
+        if report_pdf:
+            st.session_state.report_pdf_data = report_pdf
+            st.session_state.report_pdf_version = REPORT_PDF_VERSION
+
+    if not report_pdf:
+        st.error("Finora could not generate the report preview.")
+        if st.button(
+            "← Back to Overview",
+            key="report_viewer_back_error",
+            width="stretch",
+        ):
+            st.session_state.page = "Overview"
+            st.query_params["page"] = "Overview"
+            st.rerun()
+        return
+
+    # --------------------------------------------------------
+    # Validate the generated bytes BEFORE displaying them.
+    # --------------------------------------------------------
+    try:
+        reader = PdfReader(BytesIO(report_pdf))
+        page_count = len(reader.pages)
+        if page_count < 1:
+            raise ValueError("Generated PDF contains no pages.")
+    except Exception as exc:
+        st.error(f"Finora generated an invalid PDF preview: {exc}")
+        return
+
+    report_name = {
+        "Overview": "Finora_AI_Overview_Report.pdf",
+        "Merchant Analysis": "Finora_AI_Merchant_Analysis_Report.pdf",
+        "Transactions": "Finora_AI_Transactions_Report.pdf",
+    }[report_type]
+    period_text = _report_period_text(transactions)
+    tx_count = len(transactions)
+
+    # --------------------------------------------------------
+    # Write the exact bytes being downloaded to a local PDF file.
+    # This is the only source used by the browser preview.
+    # --------------------------------------------------------
+    statement_id = str(
+        st.session_state.get("statement_id") or "current"
+    )
+    safe_statement_id = re.sub(
+        r"[^a-zA-Z0-9_-]+",
+        "_",
+        statement_id,
+    ).strip("_") or "current"
+
+    preview_dir = Path("storage") / "report_previews"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+
+    preview_path = preview_dir / f"finora_report_{safe_statement_id}.pdf"
+
+    try:
+        preview_path.write_bytes(report_pdf)
+        # Verify the written file too. This catches partial/corrupt writes.
+        verify_reader = PdfReader(str(preview_path))
+        verified_pages = len(verify_reader.pages)
+        if verified_pages != page_count:
+            raise ValueError(
+                f"PDF verification failed: expected {page_count} pages, "
+                f"found {verified_pages}."
+            )
+        st.session_state.report_preview_path = str(preview_path)
+    except Exception as exc:
+        st.error(f"Finora could not prepare the PDF preview: {exc}")
+        return
+
+    # --------------------------------------------------------
+    # PAGE HEADER
+    # --------------------------------------------------------
+    st.markdown(
+        """
+        <div class="page-title">Download Report</div>
+        <div class="page-subtitle">
+            Preview and download your financial report.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    viewer_col, share_col = st.columns([3.25, 1.0], gap="medium")
+
+    # --------------------------------------------------------
+    # PDF VIEWER
+    # --------------------------------------------------------
+    with viewer_col:
+        # Use st.html for this UI fragment instead of st.markdown.
+        # This prevents the indented multiline HTML from being parsed as a
+        # Markdown code block (which is exactly what the screenshot showed).
+        st.html(
+            f"""
+            <div style="
+                min-height:58px;
+                display:flex;
+                align-items:center;
+                gap:12px;
+                padding:10px 14px;
+                border:1px solid #263953;
+                border-radius:14px;
+                background:linear-gradient(180deg,#111c2f 0%,#0b1525 100%);
+                color:#e2e8f0;
+                margin-bottom:10px;
+            ">
+                <div style="
+                    width:32px;height:32px;flex:0 0 32px;
+                    display:flex;align-items:center;justify-content:center;
+                    border-radius:9px;
+                    background:#17243a;
+                    border:1px solid #314563;
+                    font-size:16px;
+                ">📄</div>
+
+                <div style="min-width:0;flex:1;">
+                    <div style="
+                        color:#f8fafc;
+                        font-size:.82rem;
+                        font-weight:850;
+                        white-space:nowrap;
+                        overflow:hidden;
+                        text-overflow:ellipsis;
+                    ">
+                        {escape(report_name)}
+                    </div>
+                    <div style="
+                        margin-top:3px;
+                        color:#64748b;
+                        font-size:.62rem;
+                    ">
+                        Generated from the current Finora transaction data
+                    </div>
+                </div>
+
+                <div style="
+                    padding:6px 10px;
+                    border-radius:999px;
+                    background:#17243a;
+                    border:1px solid #30445f;
+                    color:#cbd5e1;
+                    font-size:.66rem;
+                    font-weight:800;
+                    white-space:nowrap;
+                ">
+                    {page_count} pages
+                </div>
+            </div>
+            """,
+        )
+
+        # CRITICAL FIX:
+        # Do not use st.iframe() or st.pdf() for this preview.
+        #
+        # st.iframe() depends on the browser loading a Streamlit media URL,
+        # which failed in this environment. st.pdf() depends on the optional
+        # streamlit-pdf component, which is not installed in this environment.
+        #
+        # Instead, render the already-validated PDF bytes directly to PNG
+        # using PyMuPDF and display the page with st.image(). This keeps the
+        # preview completely inside the Streamlit layout, so it cannot cover
+        # or steal pointer events from the Export & Share controls.
+        try:
+            try:
+                import pymupdf
+                pdf_renderer = pymupdf
+            except ImportError:
+                import fitz as pdf_renderer
+
+            pdf_document = pdf_renderer.open(
+                stream=report_pdf,
+                filetype="pdf",
+            )
+            try:
+                preview_page_count = len(pdf_document)
+                if preview_page_count != page_count:
+                    raise ValueError(
+                        f"PDF preview page count mismatch: expected {page_count}, "
+                        f"found {preview_page_count}."
+                    )
+
+                current_page = int(
+                    st.session_state.get("report_page", 1) or 1
+                )
+                current_page = max(1, min(current_page, preview_page_count))
+                st.session_state.report_page = current_page
+
+                nav_prev, nav_info, nav_next = st.columns([1, 3, 1], gap="small")
+
+                with nav_prev:
+                    if st.button(
+                        "← Previous",
+                        key="report_preview_previous",
+                        disabled=current_page <= 1,
+                        width="stretch",
+                    ):
+                        st.session_state.report_page = current_page - 1
+                        st.rerun()
+
+                with nav_info:
+                    st.markdown(
+                        f"<div style=\"text-align:center;padding:8px 0;color:#cbd5e1;font-size:.75rem;font-weight:800;\">"
+                        f"Page {current_page} of {preview_page_count}</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                with nav_next:
+                    if st.button(
+                        "Next →",
+                        key="report_preview_next",
+                        disabled=current_page >= preview_page_count,
+                        width="stretch",
+                    ):
+                        st.session_state.report_page = current_page + 1
+                        st.rerun()
+
+                pdf_page = pdf_document.load_page(current_page - 1)
+                zoom = 1.55
+                matrix = pdf_renderer.Matrix(zoom, zoom)
+                pixmap = pdf_page.get_pixmap(
+                    matrix=matrix,
+                    alpha=False,
+                    colorspace=pdf_renderer.csRGB,
+                )
+                png_bytes = pixmap.tobytes("png")
+
+                st.image(
+                    png_bytes,
+                    width="stretch",
+                )
+            finally:
+                pdf_document.close()
+
+        except Exception as exc:
+            st.error(f"Finora could not render the PDF preview: {exc}")
+
+        st.html(
+            f"""
+            <div style="
+                display:flex;
+                justify-content:space-between;
+                align-items:center;
+                gap:12px;
+                margin-top:8px;
+                color:#64748b;
+                font-size:.62rem;
+            ">
+                <span>
+                    Page preview · {page_count} pages · {escape(period_text)}
+                </span>
+                <span>
+                    {tx_count:,} transactions
+                </span>
+            </div>
+            """,
+        )
+
+    # --------------------------------------------------------
+    # EXPORT & SHARE PANEL
+    # --------------------------------------------------------
+    with share_col:
+        panel = st.container(border=True)
+        with panel:
+            st.markdown(
+                """
+                <div style="color:#f8fafc;font-size:1.05rem;font-weight:900;">
+                    Export &amp; Share Report
+                </div>
+                <div style="margin-top:5px;color:#94a3b8;font-size:.73rem;line-height:1.45;">
+                    Generate and share your financial report.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            st.markdown(
+                "<div style='height:12px'></div>",
+                unsafe_allow_html=True,
+            )
+
+            st.markdown(
+                "<div style='color:#cbd5e1;font-size:.72rem;font-weight:850;margin-bottom:7px;'>REPORT TYPE</div>",
+                unsafe_allow_html=True,
+            )
+
+            c1, c2, c3 = st.columns(3, gap="small")
+            with c1:
+                if st.button(
+                    "Overview",
+                    key="report_type_overview",
+                    type="primary" if report_type == "Overview" else "secondary",
+                    width="stretch",
+                ) and report_type != "Overview":
+                    st.session_state.report_type = "Overview"
+                    st.session_state.report_pdf_data = _build_report_pdf_by_type("Overview", transactions)
+                    st.session_state.report_page = 1
+                    st.rerun()
+            with c2:
+                if st.button(
+                    "Merchant Analysis",
+                    key="report_type_merchant",
+                    type="primary" if report_type == "Merchant Analysis" else "secondary",
+                    width="stretch",
+                ) and report_type != "Merchant Analysis":
+                    st.session_state.report_type = "Merchant Analysis"
+                    st.session_state.report_pdf_data = _build_report_pdf_by_type("Merchant Analysis", transactions)
+                    st.session_state.report_page = 1
+                    st.rerun()
+            with c3:
+                if st.button(
+                    "Transactions",
+                    key="report_type_transactions",
+                    type="primary" if report_type == "Transactions" else "secondary",
+                    width="stretch",
+                ) and report_type != "Transactions":
+                    st.session_state.report_type = "Transactions"
+                    st.session_state.report_pdf_data = _build_report_pdf_by_type("Transactions", transactions)
+                    st.session_state.report_page = 1
+                    st.rerun()
+
+            st.markdown(
+                "<div style='color:#cbd5e1;font-size:.72rem;font-weight:850;margin:14px 0 7px;'>DATE RANGE</div>",
+                unsafe_allow_html=True,
+            )
+            st.info(period_text)
+
+            st.markdown(
+                "<div style='color:#cbd5e1;font-size:.72rem;font-weight:850;margin:14px 0 7px;'>INCLUDED IN REPORT</div>",
+                unsafe_allow_html=True,
+            )
+
+            included_sections = [
+                "Summary & Key Metrics",
+                "Spending Trends",
+                "Category Breakdown",
+                "Top Merchants",
+                "Merchant Share",
+                "Complete Transaction Ledger",
+                "Reconciliation & Review",
+            ]
+
+            for section in included_sections:
+                st.markdown(
+                    f"<div style='display:flex;gap:8px;align-items:center;padding:4px 0;color:#cbd5e1;font-size:.72rem;'><span style='width:18px;height:18px;border-radius:5px;background:#635BFF;color:white;display:flex;align-items:center;justify-content:center;font-size:12px;'>✓</span>{escape(section)}</div>",
+                    unsafe_allow_html=True,
+                )
+
+            st.markdown(
+                "<div style='color:#cbd5e1;font-size:.72rem;font-weight:850;margin:14px 0 7px;'>FORMAT</div>",
+                unsafe_allow_html=True,
+            )
+
+            f1, f2 = st.columns(2, gap="small")
+            with f1:
+                st.markdown(
+                    """
+                    <div style="border:1px solid #7c3aed;background:rgba(99,102,241,.14);border-radius:12px;padding:10px;">
+                        <div style="font-size:.78rem;font-weight:850;color:#f8fafc;">📄 PDF</div>
+                        <div style="margin-top:2px;font-size:.60rem;color:#94a3b8;">Best for sharing</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            with f2:
+                st.markdown(
+                    """
+                    <div style="border:1px solid #25364f;background:#0d1626;border-radius:12px;padding:10px;opacity:.55;">
+                        <div style="font-size:.78rem;font-weight:850;color:#cbd5e1;">🖼 PNG</div>
+                        <div style="margin-top:2px;font-size:.60rem;color:#64748b;">Image format</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            st.markdown("<div style='height:9px'></div>", unsafe_allow_html=True)
+
+            if st.button(
+                "📄 Generate PDF",
+                key="report_viewer_generate_pdf",
+                type="primary",
+                width="stretch",
+            ):
+                fresh_pdf = _build_report_pdf_by_type(report_type, transactions)
+                if fresh_pdf:
+                    st.session_state.report_pdf_data = fresh_pdf
+                    st.session_state.report_page = 1
+                    st.toast(f"{report_type} report regenerated from the latest transaction data.")
+                    st.rerun()
+
+            st.download_button(
+                "⬇️ Download PDF",
+                data=report_pdf,
+                file_name=report_name,
+                mime="application/pdf",
+                key="report_viewer_download_pdf",
+                width="stretch",
+            )
+
+            # Share API is isolated from the PDF viewer. The PDF bytes are
+            # encoded only for the browser's native share action.
+            encoded_pdf = base64.b64encode(report_pdf).decode("ascii")
+            share_html = f"""
+            <div style="margin-top:8px;">
+                <button id="share-report" style="
+                    width:100%;height:42px;border-radius:10px;
+                    border:1px solid #334155;background:#0b1422;
+                    color:#f8fafc;font-weight:800;font-size:14px;cursor:pointer;
+                ">🔗 Share Report</button>
+                <div id="share-status" style="margin-top:7px;color:#64748b;font-size:11px;text-align:center;"></div>
+            </div>
+            <script>
+                const bytes = atob({json.dumps(encoded_pdf)});
+                const arr = new Uint8Array(bytes.length);
+                for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+                const blob = new Blob([arr], {{type:'application/pdf'}});
+                const file = new File([blob], {json.dumps(report_name)}, {{type:'application/pdf'}});
+                const btn = document.getElementById('share-report');
+                const status = document.getElementById('share-status');
+                btn.onclick = async () => {{
+                    try {{
+                        if (navigator.share && navigator.canShare && navigator.canShare({{files:[file]}})) {{
+                            await navigator.share({{
+                                title:'Finora AI Financial Report',
+                                text:'Finora AI financial report — {escape(period_text)}',
+                                files:[file]
+                            }});
+                            status.textContent = 'Report shared successfully.';
+                        }} else if (navigator.share) {{
+                            await navigator.share({{
+                                title:'Finora AI Financial Report',
+                                text:'Finora AI financial report — {escape(period_text)}'
+                            }});
+                            status.textContent = 'Share sheet opened.';
+                        }} else if (navigator.clipboard) {{
+                            await navigator.clipboard.writeText(
+                                'Finora AI Financial Report — {escape(period_text)} — {tx_count} transactions'
+                            );
+                            status.textContent = 'Report details copied. Download the PDF to attach it.';
+                        }} else {{
+                            status.textContent = 'Use Download PDF to share the report manually.';
+                        }}
+                    }} catch (err) {{
+                        if (err && err.name === 'AbortError') return;
+                        status.textContent = 'Use Download PDF to share the report manually.';
+                    }}
+                }};
+            </script>
+            """
+            components.html(share_html, height=72, scrolling=False)
+
+            st.markdown(
+                "<div style='margin-top:11px;color:#64748b;font-size:.60rem;line-height:1.45;text-align:center;'>The preview and download always use the same generated Finora PDF bytes.</div>",
+                unsafe_allow_html=True,
+            )
+
+    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+
+    if st.button(
+        "← Back to Overview",
+        key="report_viewer_back_overview",
+    ):
+        st.session_state.page = "Overview"
+        st.query_params["page"] = "Overview"
+        st.rerun()
+
+
+if st.session_state.page == "Report":
+    render_report_viewer_page(transactions)
+
+
 if st.session_state.page == "Overview":
 
     # ========================================================
-    # PDF EXPORT — ALWAYS BUILT FROM CURRENT TRANSACTION DATA
+    # PDF EXPORT / REPORT VIEW — ALWAYS BUILT FROM CURRENT DATA
     # ========================================================
 
-    pdf_left, pdf_right = st.columns([4.9, 1.1])
+    pdf_left, pdf_right = st.columns([4.15, 1.85], gap="small")
     with pdf_right:
         try:
+            current_transactions = st.session_state.get("transactions") or []
             overview_pdf = build_finora_report(
-                st.session_state.get("transactions") or [],
+                current_transactions,
                 file_name=st.session_state.get("file_name"),
                 statement_metadata=get_statement_metadata(),
             )
-            st.download_button(
-                "📄 Download Overview PDF",
-                data=overview_pdf,
-                file_name="finora_financial_intelligence_report.pdf",
-                mime="application/pdf",
-                key="download_overview_pdf_live_v4",
+            full_report_pdf = _build_full_combined_report_pdf(current_transactions)
+
+            if st.button(
+                "📄 View & Download Report",
+                key="view_overview_pdf_live_v7",
                 width="stretch",
-                help="Generated from the latest saved transaction categories and totals.",
+                help="Open the Finora report viewer.",
+            ):
+                st.session_state.report_type = "Overview"
+                st.session_state.report_pdf_data = overview_pdf
+                st.session_state.report_pdf_version = REPORT_PDF_VERSION
+                st.session_state.report_page = 1
+                st.session_state.page = "Report"
+                st.query_params["page"] = "Report"
+                st.rerun()
+
+            st.download_button(
+                "⬇️ Download Full Financial Report",
+                data=full_report_pdf,
+                file_name="finora_complete_financial_intelligence_report.pdf",
+                mime="application/pdf",
+                key="download_full_financial_report_v1",
+                width="stretch",
+                help="Download one complete PDF containing Overview, all Merchant Analysis categories, and the full Transactions ledger.",
             )
         except Exception as exc:
             print(f"Finora PDF report error: {exc}")
@@ -5738,7 +6778,9 @@ if st.session_state.page == "Overview":
     # --------------------------------------------------------
 
     if credit_card_mode:
+        card_spent = expenses
         story = (
+            f"Total card spending is <strong>{money(card_spent, currency)}</strong>. "
             f"Your current card balance is <strong>{money(credit_card.get('current_balance', 0), currency)}</strong> "
             f"against a <strong>{money(credit_card.get('card_limit', 0), currency)}</strong> credit limit, "
             f"leaving <strong>{money(credit_card.get('available_limit', 0), currency)}</strong> available."
@@ -5774,6 +6816,21 @@ if st.session_state.page == "Overview":
             "across this statement."
         )
         pill = "Balanced cash movement"
+
+    if credit_card_mode:
+        current_balance_metric = f"""
+            <div class="cockpit-metric">
+                <div class="cockpit-metric-label">Current balance</div>
+                <div class="cockpit-metric-value">
+                    {money(credit_card.get('current_balance', 0), currency)}
+                </div>
+                <div class="cockpit-metric-sub">
+                    outstanding card balance
+                </div>
+            </div>
+            """
+    else:
+        current_balance_metric = ""
 
     render(f"""
     <div class="finora-cockpit">
@@ -5813,15 +6870,16 @@ if st.session_state.page == "Overview":
             </div>
 
             <div class="cockpit-metric">
-                <div class="cockpit-metric-label">{"Current balance" if credit_card_mode else "Spent"}</div>
+                <div class="cockpit-metric-label">{"Card spent" if credit_card_mode else "Spent"}</div>
                 <div class="cockpit-metric-value">
-                    {money(credit_card.get('current_balance', 0), currency) if credit_card_mode else money(expenses, currency)}
+                    {money(expenses, currency) if credit_card_mode else money(expenses, currency)}
                 </div>
                 <div class="cockpit-metric-sub">
-                    {"outstanding card balance" if credit_card_mode else "money going out"}
+                    {"total purchases / charges" if credit_card_mode else "money going out"}
                 </div>
             </div>
 
+            {current_balance_metric}
             <div class="cockpit-metric">
                 <div class="cockpit-metric-label">{"Available credit" if credit_card_mode else "Net movement"}</div>
                 <div class="cockpit-metric-value">
@@ -6506,6 +7564,1474 @@ if st.session_state.page == "Overview":
     </div>
     """)
     render_floating_finora_chat(transactions)
+
+
+
+
+# ============================================================
+# MERCHANT ANALYSIS
+# ============================================================
+
+def render_merchant_analysis_page(transactions):
+    """Render the approved Finora Merchant Analysis reference UI."""
+
+    df = make_dataframe(transactions)
+
+    if df.empty:
+        st.html("""
+        <div class="page-title">Merchant Analysis</div>
+        <div class="page-subtitle">
+            See how your spending is distributed across merchants in each category.
+        </div>
+        """)
+        st.info("Analyze a statement first to unlock Merchant Analysis.")
+        return
+
+    df = df.copy()
+
+    # ========================================================
+    # NORMALISE ANALYSIS DATA
+    # ========================================================
+
+    if "Direction" not in df.columns:
+        df["Direction"] = ""
+    if "Amount" not in df.columns:
+        df["Amount"] = 0.0
+    if "Category" not in df.columns:
+        df["Category"] = "Uncategorized"
+    if "Merchant" not in df.columns:
+        df["Merchant"] = ""
+    if "Description" not in df.columns:
+        df["Description"] = ""
+    if "Date" not in df.columns:
+        df["Date"] = ""
+
+    df["Direction"] = (
+        df["Direction"]
+        .fillna("")
+        .astype(str)
+        .str.casefold()
+        .str.strip()
+    )
+
+    df["Amount"] = (
+        pd.to_numeric(
+            df["Amount"],
+            errors="coerce",
+        )
+        .fillna(0.0)
+        .abs()
+    )
+
+    df["Category"] = (
+        df["Category"]
+        .fillna("Uncategorized")
+        .astype(str)
+        .str.strip()
+    )
+    df["Category"] = df["Category"].where(
+        df["Category"] != "",
+        "Uncategorized",
+    )
+
+    df["Merchant"] = (
+        df["Merchant"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    df["Merchant"] = df["Merchant"].where(
+        df["Merchant"] != "",
+        df["Description"].fillna("").astype(str).str.strip(),
+    )
+    df["Merchant"] = df["Merchant"].where(
+        df["Merchant"] != "",
+        "Unknown merchant",
+    )
+
+    debit_df = df[
+        df["Direction"] == "debit"
+    ].copy()
+
+    if debit_df.empty:
+        st.html("""
+        <div class="page-title">Merchant Analysis</div>
+        <div class="page-subtitle">
+            See how your spending is distributed across merchants in each category.
+        </div>
+        """)
+        st.info(
+            "No outgoing transactions are available for Merchant Analysis."
+        )
+        return
+
+    currency = get_currency(transactions)
+    total_statement_spending = float(
+        debit_df["Amount"].sum()
+    )
+
+    # ========================================================
+    # PAGE HEADER
+    # ========================================================
+
+    st.html("""
+    <div class="page-title">Merchant Analysis</div>
+    <div class="page-subtitle">
+        See how your spending is distributed across merchants in each category.
+    </div>
+    """)
+
+    # ========================================================
+    # CATEGORY DATA
+    # ========================================================
+
+    category_summary = (
+        debit_df
+        .groupby("Category", as_index=False)["Amount"]
+        .sum()
+        .sort_values(
+            ["Amount", "Category"],
+            ascending=[False, True],
+        )
+        .reset_index(drop=True)
+    )
+
+    categories = (
+        category_summary["Category"]
+        .astype(str)
+        .tolist()
+    )
+
+    preferred_visible = [
+        "Food & Dining",
+        "Groceries",
+        "Transportation",
+        "Shopping",
+        "Bills & Utilities",
+        "Healthcare",
+    ]
+
+    visible_categories = [
+        category
+        for category in preferred_visible
+        if category in categories
+    ]
+
+    # Keep the reference at six featured categories whenever possible.
+    for category in categories:
+        if category in visible_categories:
+            continue
+        if category in {"Uncategorized", "Other"}:
+            continue
+        if len(visible_categories) >= 6:
+            break
+        visible_categories.append(category)
+
+    hidden_categories = [
+        category
+        for category in categories
+        if category not in visible_categories
+    ]
+
+    saved_category = st.session_state.get(
+        "merchant_analysis_category"
+    )
+
+    # Reference opens on Food & Dining whenever it exists.
+    default_category = (
+        "Food & Dining"
+        if "Food & Dining" in categories
+        else categories[0]
+    )
+
+    if saved_category not in categories:
+        saved_category = default_category
+        st.session_state.merchant_analysis_category = (
+            saved_category
+        )
+
+    selected_category = saved_category
+
+    # ========================================================
+    # REFERENCE UI CSS
+    # ========================================================
+
+    st.html("""
+    <style>
+    /* ======================================================
+       FINORA MERCHANT ANALYSIS — REFERENCE UI
+       ====================================================== */
+
+    .ma-selector-shell {
+        margin-top: 16px;
+        padding: 10px;
+        border: 1px solid rgba(99,102,241,.75);
+        border-radius: 16px;
+        background:
+            linear-gradient(
+                145deg,
+                rgba(11,23,48,.96),
+                rgba(10,18,32,.96)
+            );
+        box-shadow:
+            0 0 0 1px rgba(99,102,241,.06) inset,
+            0 12px 38px rgba(0,0,0,.16);
+    }
+
+    .ma-selector-label {
+        height: 58px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 0 8px;
+        color: #f8fafc;
+        font-size: .82rem;
+        font-weight: 850;
+        white-space: nowrap;
+    }
+
+    .ma-selector-label-icon {
+        width: 32px;
+        height: 32px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 10px;
+        color: #c4b5fd;
+        background: rgba(99,102,241,.12);
+        border: 1px solid rgba(129,140,248,.24);
+        font-size: 17px;
+    }
+
+    div[class*="st-key-ma_category_chip_"] button {
+        min-height: 58px !important;
+        border-radius: 14px !important;
+        padding: 7px 13px !important;
+        border: 1px solid #263b5a !important;
+        background:
+            linear-gradient(
+                145deg,
+                #101a2a,
+                #0d1625
+            ) !important;
+        color: #dbeafe !important;
+        box-shadow: none !important;
+        text-align: left !important;
+    }
+
+    div[class*="st-key-ma_category_chip_"] button:hover {
+        border-color: rgba(129,140,248,.72) !important;
+        color: #fff !important;
+        transform: translateY(-1px) !important;
+    }
+
+    div[class*="st-key-ma_category_chip_"] button[kind="primary"] {
+        background:
+            linear-gradient(
+                110deg,
+                #7c3aed,
+                #6366f1,
+                #8b5cf6
+            ) !important;
+        border-color: rgba(196,181,253,.68) !important;
+        color: #fff !important;
+        box-shadow:
+            0 10px 28px rgba(99,102,241,.24) !important;
+    }
+
+    div[class*="st-key-ma_category_chip_"] button p {
+        margin: 0 !important;
+        line-height: 1.28 !important;
+        white-space: nowrap !important;
+        font-size: .72rem !important;
+        font-weight: 800 !important;
+    }
+
+    div[class*="st-key-ma_more_categories"] button {
+        min-height: 58px !important;
+        border-radius: 14px !important;
+        padding: 7px 13px !important;
+        border: 1px dashed #40506a !important;
+        background: #0e1726 !important;
+        color: #cbd5e1 !important;
+        font-size: .72rem !important;
+        font-weight: 850 !important;
+        box-shadow: none !important;
+    }
+
+    div[class*="st-key-ma_more_categories"] button:hover {
+        border-color: #818cf8 !important;
+        color: #fff !important;
+    }
+
+    .ma-summary-shell {
+        margin-top: 16px;
+    }
+
+    .ma-summary-note {
+        color: #64748b;
+        font-size: .69rem;
+        line-height: 1.4;
+    }
+
+    .ma-summary-kicker {
+        color: #64748b;
+        font-size: .58rem;
+        font-weight: 850;
+        letter-spacing: .12em;
+    }
+
+    .ma-summary-value {
+        margin-top: 7px;
+        color: #f8fafc;
+        font-size: 1.16rem;
+        font-weight: 900;
+    }
+
+    .ma-panel-title {
+        color: #f8fafc;
+        font-size: 1.04rem;
+        font-weight: 860;
+    }
+
+    .ma-panel-subtitle {
+        margin-top: 5px;
+        color: #64748b;
+        font-size: .65rem;
+    }
+
+    .ma-rank-button button {
+        min-height:32px !important;
+        padding:4px 6px !important;
+        border-radius:8px !important;
+        border:1px solid transparent !important;
+        background:transparent !important;
+        color:#e2e8f0 !important;
+        text-align:left !important;
+        font-size:.74rem !important;
+        font-weight:800 !important;
+        box-shadow:none !important;
+    }
+
+    .ma-rank-button button:hover {
+        border-color:rgba(99,102,241,.30) !important;
+        color:#fff !important;
+        background:rgba(99,102,241,.06) !important;
+    }
+
+    .ma-ditto-rank-track {
+        margin:4px 0 11px 0;
+        height:4px;
+        border-radius:999px;
+        background:#172238;
+        overflow:hidden;
+    }
+
+
+    div[class*="st-key-ma_top_ditto_"] button {
+        min-height:32px !important;
+        padding:4px 6px !important;
+        border-radius:8px !important;
+        border:1px solid transparent !important;
+        background:transparent !important;
+        color:#e2e8f0 !important;
+        text-align:left !important;
+        font-size:.74rem !important;
+        font-weight:800 !important;
+        box-shadow:none !important;
+    }
+
+    div[class*="st-key-ma_top_ditto_"] button:hover {
+        border-color:rgba(99,102,241,.30) !important;
+        color:#fff !important;
+        background:rgba(99,102,241,.06) !important;
+    }
+
+    .ma-rank-meta {
+        text-align: right;
+        padding-top: 6px;
+    }
+
+    .ma-rank-amount {
+        color: #f8fafc;
+        font-size: .73rem;
+        font-weight: 850;
+        white-space: nowrap;
+    }
+
+    .ma-rank-share {
+        margin-top: 3px;
+        color: #64748b;
+        font-size: .60rem;
+        white-space: nowrap;
+    }
+
+    .ma-rank-track {
+        margin: 4px 0 10px 34px;
+        height: 4px;
+        border-radius: 999px;
+        background: #172238;
+        overflow: hidden;
+    }
+
+    .ma-share-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 5px 0;
+        border-bottom: 1px solid rgba(29,41,59,.58);
+    }
+
+    .ma-share-label {
+        display: flex;
+        align-items: center;
+        min-width: 0;
+        gap: 7px;
+        color: #cbd5e1;
+        font-size: .62rem;
+    }
+
+    .ma-share-dot {
+        width: 7px;
+        height: 7px;
+        flex: 0 0 7px;
+        border-radius: 50%;
+    }
+
+    .ma-share-pct {
+        color: #94a3b8;
+        font-size: .62rem;
+        white-space: nowrap;
+    }
+
+    </style>
+    """)
+
+    # ========================================================
+    # CATEGORY SELECTOR — SINGLE REFERENCE ROW
+    # ========================================================
+
+    selector_columns = st.columns(
+        [1.02, 1.06, 1.02, 1.11, .98, 1.02, 1.03, 1.15],
+        gap="small",
+    )
+
+    with selector_columns[0]:
+        st.html("""
+        <div class="ma-selector-label">
+            <span class="ma-selector-label-icon">▦</span>
+            <span>Select a category</span>
+        </div>
+        """)
+
+    for index, category_name in enumerate(
+        visible_categories[:6],
+        start=1,
+    ):
+
+        row = category_summary[
+            category_summary["Category"] == category_name
+        ]
+
+        if row.empty:
+            continue
+
+        amount = float(row["Amount"].iloc[0])
+        share = (
+            amount / total_statement_spending * 100
+            if total_statement_spending
+            else 0.0
+        )
+        icon = overview_category_icon(category_name)
+
+        safe_key = (
+            re.sub(
+                r"[^a-z0-9]+",
+                "_",
+                category_name.casefold(),
+            )
+            .strip("_")
+            or "category"
+        )
+
+        with selector_columns[index]:
+
+            if st.button(
+                f"{icon} {category_name}\n"
+                f"{money(amount, currency)} · {share:.1f}%",
+                key=f"ma_category_chip_{index}_{safe_key}",
+                type=(
+                    "primary"
+                    if category_name == selected_category
+                    else "secondary"
+                ),
+                width="stretch",
+                help=f"Analyze {category_name}",
+            ):
+
+                st.session_state.merchant_analysis_category = (
+                    category_name
+                )
+                st.rerun()
+
+    with selector_columns[7]:
+
+        with st.popover(
+            "••• More Categories  ▾",
+            use_container_width=True,
+        ):
+
+            st.html("""
+            <div style="
+                margin-bottom:9px;
+                color:#f8fafc;
+                font-size:.86rem;
+                font-weight:850;
+            ">
+                More Categories
+            </div>
+            <div style="
+                margin-bottom:11px;
+                color:#64748b;
+                font-size:.64rem;
+            ">
+                Select another spending category.
+            </div>
+            """)
+
+            for more_index, category_name in enumerate(
+                hidden_categories
+            ):
+
+                row = category_summary[
+                    category_summary["Category"] == category_name
+                ]
+
+                if row.empty:
+                    continue
+
+                amount = float(row["Amount"].iloc[0])
+                share = (
+                    amount / total_statement_spending * 100
+                    if total_statement_spending
+                    else 0.0
+                )
+                icon = overview_category_icon(category_name)
+
+                if st.button(
+                    f"{icon} {category_name} · "
+                    f"{money(amount, currency)} · {share:.1f}%",
+                    key=f"ma_more_category_{more_index}",
+                    width="stretch",
+                    type=(
+                        "primary"
+                        if category_name == selected_category
+                        else "secondary"
+                    ),
+                ):
+                    st.session_state.merchant_analysis_category = (
+                        category_name
+                    )
+                    st.rerun()
+
+    # ========================================================
+    # SELECTED CATEGORY
+    # ========================================================
+
+    selected_df = debit_df[
+        debit_df["Category"] == selected_category
+    ].copy()
+
+    selected_total = float(
+        selected_df["Amount"].sum()
+    )
+
+    selected_transactions = int(
+        len(selected_df)
+    )
+
+    selected_average = (
+        selected_total / selected_transactions
+        if selected_transactions
+        else 0.0
+    )
+
+    selected_share = (
+        selected_total
+        / total_statement_spending
+        * 100
+        if total_statement_spending
+        else 0.0
+    )
+
+    selected_icon = overview_category_icon(
+        selected_category
+    )
+
+    top_category_merchants = (
+        selected_df
+        .groupby("Merchant", as_index=False)["Amount"]
+        .sum()
+        .sort_values(
+            ["Amount", "Merchant"],
+            ascending=[False, True],
+        )
+        .reset_index(drop=True)
+    )
+
+    top_merchant_name = (
+        str(
+            top_category_merchants.iloc[0][
+                "Merchant"
+            ]
+        )
+        if not top_category_merchants.empty
+        else "No merchant"
+    )
+
+    # Category descriptions used by the reference design.
+    category_descriptions = {
+        "Food & Dining": (
+            "Restaurant, cafes, food delivery and dining expenses."
+        ),
+        "Groceries": (
+            "Supermarkets, groceries and everyday food essentials."
+        ),
+        "Transportation": (
+            "Fuel, taxis, public transport and travel-related spending."
+        ),
+        "Shopping": (
+            "Retail, clothing, electronics and personal purchases."
+        ),
+        "Bills & Utilities": (
+            "Utilities, telecom, subscriptions and recurring bills."
+        ),
+        "Healthcare": (
+            "Medical, pharmacy and health-related expenses."
+        ),
+        "Saloon": (
+            "Personal grooming and salon-related expenses."
+        ),
+        "Entertainment": (
+            "Leisure, recreation and entertainment expenses."
+        ),
+        "Other": (
+            "Spending that does not fit the primary categories."
+        ),
+        "Uncategorized": (
+            "Transactions that have not yet been assigned a specific category."
+        ),
+    }
+
+    category_description = category_descriptions.get(
+        selected_category,
+        "Spending activity grouped under this category.",
+    )
+
+    # ========================================================
+    # SUMMARY CARD
+    # ========================================================
+
+    with st.container(
+        border=True,
+        key="merchant_analysis_summary_reference",
+    ):
+
+        info_col, spend_col, txn_col, avg_col, share_col_summary = st.columns(
+            [1.72, 1.0, .82, 1.0, .82],
+            gap="medium",
+        )
+
+        with info_col:
+
+            st.html(
+                f"""
+                <div style="
+                    min-height:72px;
+                    display:flex;
+                    align-items:center;
+                    gap:13px;
+                ">
+
+                    <div style="
+                        width:48px;
+                        height:48px;
+                        flex:0 0 48px;
+                        display:flex;
+                        align-items:center;
+                        justify-content:center;
+                        border-radius:14px;
+                        background:rgba(99,102,241,.12);
+                        border:1px solid rgba(129,140,248,.30);
+                        font-size:24px;
+                    ">
+                        {selected_icon}
+                    </div>
+
+                    <div style="min-width:0;">
+                        <div style="
+                            color:#f8fafc;
+                            font-size:1.18rem;
+                            font-weight:900;
+                        ">
+                            {escape(selected_category)}
+                        </div>
+
+                        <div style="
+                            margin-top:3px;
+                            color:#94a3b8;
+                            font-size:.65rem;
+                            line-height:1.4;
+                            max-width:410px;
+                        ">
+                            {escape(category_description)}
+                        </div>
+
+                        <div style="
+                            margin-top:3px;
+                            color:#64748b;
+                            font-size:.62rem;
+                        ">
+                            {escape(top_merchant_name)} leads this category
+                        </div>
+                    </div>
+                </div>
+                """
+            )
+
+        summary_metrics = [
+            (
+                spend_col,
+                "SPENDING",
+                money(selected_total, currency),
+            ),
+            (
+                txn_col,
+                "TRANSACTIONS",
+                f"{selected_transactions:,}",
+            ),
+            (
+                avg_col,
+                "AVERAGE",
+                money(selected_average, currency),
+            ),
+            (
+                share_col_summary,
+                "SHARE",
+                f"{selected_share:.1f}%",
+            ),
+        ]
+
+        for metric_col, label, value in summary_metrics:
+            with metric_col:
+                st.html(
+                    f"""
+                    <div style="
+                        min-height:72px;
+                        padding:8px 0;
+                        border-left:1px solid #1c2a3f;
+                        padding-left:18px;
+                    ">
+                        <div class="ma-summary-kicker">
+                            {label}
+                        </div>
+                        <div class="ma-summary-value">
+                            {escape(value)}
+                        </div>
+                    </div>
+                    """
+                )
+
+    # ========================================================
+    # THREE MAIN PANELS
+    # ========================================================
+
+    trend_col, merchants_col, share_col = st.columns(
+        [1.18, 1.0, 1.0],
+        gap="medium",
+    )
+
+    # ========================================================
+    # SPENDING TREND
+    # ========================================================
+
+    with trend_col:
+
+        with st.container(
+            border=True,
+            key="merchant_analysis_spending_trend_reference",
+        ):
+
+            trend_head_left, trend_head_right = st.columns(
+                [1.0, .86],
+                gap="small",
+            )
+
+            with trend_head_left:
+                st.html("""
+                <div>
+                    <div class="ma-panel-title">
+                        ︿ Spending Trend
+                    </div>
+                    <div class="ma-panel-subtitle">
+                        Spending and transaction activity over time.
+                    </div>
+                </div>
+                """)
+
+            with trend_head_right:
+
+                active_granularity = st.session_state.get(
+                    "merchant_analysis_granularity",
+                    "monthly",
+                )
+
+                if active_granularity not in {
+                    "monthly",
+                    "weekly",
+                }:
+                    active_granularity = "monthly"
+
+                b1, b2 = st.columns(
+                    2,
+                    gap="small",
+                )
+
+                with b1:
+                    if st.button(
+                        "Monthly",
+                        key="ma_monthly_reference",
+                        type=(
+                            "primary"
+                            if active_granularity == "monthly"
+                            else "secondary"
+                        ),
+                        width="stretch",
+                    ):
+                        st.session_state.merchant_analysis_granularity = (
+                            "monthly"
+                        )
+                        st.rerun()
+
+                with b2:
+                    if st.button(
+                        "Weekly",
+                        key="ma_weekly_reference",
+                        type=(
+                            "primary"
+                            if active_granularity == "weekly"
+                            else "secondary"
+                        ),
+                        width="stretch",
+                    ):
+                        st.session_state.merchant_analysis_granularity = (
+                            "weekly"
+                        )
+                        st.rerun()
+
+            trend = selected_df.copy()
+            trend["ParsedDate"] = pd.to_datetime(
+                trend["Date"],
+                errors="coerce",
+            )
+            trend = trend.dropna(
+                subset=["ParsedDate"]
+            )
+
+            if not trend.empty:
+
+                if active_granularity == "weekly":
+                    trend["Period"] = (
+                        trend["ParsedDate"]
+                        .dt.to_period("W")
+                        .apply(
+                            lambda period:
+                            period.start_time
+                        )
+                    )
+                    label_format = "%d %b"
+                else:
+                    trend["Period"] = (
+                        trend["ParsedDate"]
+                        .dt.to_period("M")
+                        .dt.to_timestamp()
+                    )
+                    label_format = "%b"
+
+                spending_series = (
+                    trend
+                    .groupby("Period")["Amount"]
+                    .sum()
+                    .sort_index()
+                )
+
+                transaction_series = (
+                    trend
+                    .groupby("Period")
+                    .size()
+                    .reindex(
+                        spending_series.index
+                    )
+                    .fillna(0)
+                )
+
+                labels = [
+                    period.strftime(label_format)
+                    for period in spending_series.index
+                ]
+
+                trend_figure = go.Figure()
+
+                trend_figure.add_trace(
+                    go.Bar(
+                        x=labels,
+                        y=spending_series.values,
+                        name="Spending",
+                        marker=dict(
+                            color="#F45B86",
+                        ),
+                        hovertemplate=(
+                            "%{x}<br>"
+                            + f"Spending: {currency} "
+                            + "%{y:,.2f}<extra></extra>"
+                        ),
+                    )
+                )
+
+                trend_figure.add_trace(
+                    go.Scatter(
+                        x=labels,
+                        y=transaction_series.values,
+                        name="Transactions",
+                        mode="lines+markers",
+                        yaxis="y2",
+                        line=dict(
+                            color="#A78BFA",
+                            width=2.4,
+                        ),
+                        marker=dict(
+                            color="#C4B5FD",
+                            size=6,
+                        ),
+                        hovertemplate=(
+                            "%{x}<br>"
+                            "Transactions: %{y:.0f}"
+                            "<extra></extra>"
+                        ),
+                    )
+                )
+
+                trend_figure.update_layout(
+                    height=286,
+                    margin=dict(
+                        l=4,
+                        r=7,
+                        t=4,
+                        b=4,
+                    ),
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(
+                        color="#94A3B8",
+                        size=9,
+                    ),
+                    showlegend=False,
+                    bargap=.34,
+                    xaxis=dict(
+                        showgrid=False,
+                        zeroline=False,
+                        tickfont=dict(
+                            color="#64748B",
+                            size=8,
+                        ),
+                    ),
+                    yaxis=dict(
+                        showgrid=True,
+                        gridcolor="rgba(100,116,139,.11)",
+                        zeroline=False,
+                        tickfont=dict(
+                            color="#64748B",
+                            size=8,
+                        ),
+                        title=None,
+                    ),
+                    yaxis2=dict(
+                        overlaying="y",
+                        side="right",
+                        showgrid=False,
+                        zeroline=False,
+                        tickfont=dict(
+                            color="#64748B",
+                            size=8,
+                        ),
+                        title=None,
+                    ),
+                    hoverlabel=dict(
+                        bgcolor="#0F172A",
+                        bordercolor="#334155",
+                        font=dict(
+                            color="#F8FAFC",
+                        ),
+                    ),
+                )
+
+                st.plotly_chart(
+                    trend_figure,
+                    width="stretch",
+                    config={
+                        "displayModeBar": False,
+                    },
+                    key="ma_spending_trend_figure_reference",
+                )
+
+                st.html("""
+                <div style="
+                    display:flex;
+                    justify-content:center;
+                    gap:18px;
+                    color:#77879b;
+                    font-size:.60rem;
+                    margin-top:-4px;
+                ">
+                    <span>
+                        <span style="color:#F45B86;">●</span>
+                        Spending
+                    </span>
+                    <span>
+                        <span style="color:#A78BFA;">●</span>
+                        Transactions
+                    </span>
+                </div>
+                """)
+
+            else:
+                st.info(
+                    "No dated transactions are available for this category."
+                )
+
+    # ========================================================
+    # TOP MERCHANTS — DITTO REFERENCE STYLE
+    # ========================================================
+
+    with merchants_col:
+
+        with st.container(
+            border=True,
+            key="merchant_analysis_top_merchants_reference",
+        ):
+
+            header_left, header_right = st.columns(
+                [1.0, .26],
+                gap="small",
+            )
+
+            with header_left:
+                st.html("""
+                <div>
+                    <div class="ma-panel-title">
+                        ▤ Top Merchants
+                    </div>
+                    <div class="ma-panel-subtitle">
+                        Highest spending in this category.
+                    </div>
+                </div>
+                """)
+
+            with header_right:
+                st.html(
+                    f"""
+                    <div style="
+                        text-align:right;
+                        padding-top:5px;
+                        color:#64748b;
+                        font-size:.61rem;
+                    ">
+                        {selected_transactions:,} txns
+                    </div>
+                    """
+                )
+
+            merchant_table = (
+                selected_df
+                .groupby(
+                    "Merchant",
+                    as_index=False,
+                )
+                .agg(
+                    Amount=("Amount", "sum"),
+                    Transactions=("Amount", "count"),
+                )
+                .sort_values(
+                    ["Amount", "Merchant"],
+                    ascending=[False, True],
+                )
+                .reset_index(drop=True)
+            )
+
+            top_five = merchant_table.head(5)
+
+            max_amount = (
+                float(top_five["Amount"].max())
+                if not top_five.empty
+                else 0.0
+            )
+
+            for position, (_, row) in enumerate(
+                top_five.iterrows(),
+                start=1,
+            ):
+
+                merchant_name = str(
+                    row["Merchant"]
+                )
+
+                amount = float(
+                    row["Amount"]
+                )
+
+                count = int(
+                    row["Transactions"]
+                )
+
+                share = (
+                    amount / selected_total * 100
+                    if selected_total
+                    else 0.0
+                )
+
+                bar_width = (
+                    amount / max_amount * 100
+                    if max_amount
+                    else 0.0
+                )
+
+                safe_key = (
+                    re.sub(
+                        r"[^a-z0-9]+",
+                        "_",
+                        merchant_name.casefold(),
+                    )
+                    .strip("_")
+                    or "merchant"
+                )
+
+                # Exact reference geometry:
+                # rank circle | merchant + bar | amount + count/share
+                row_left, row_right = st.columns(
+                    [.82, .18],
+                    gap="small",
+                )
+
+                with row_left:
+
+                    rank_col, merchant_col_inner = st.columns(
+                        [.10, .90],
+                        gap="small",
+                    )
+
+                    with rank_col:
+                        st.html(
+                            f"""
+                            <div style="
+                                width:24px;
+                                height:24px;
+                                margin-top:7px;
+                                display:flex;
+                                align-items:center;
+                                justify-content:center;
+                                border-radius:50%;
+                                background:#15233e;
+                                border:1px solid #263b5a;
+                                color:#dbeafe;
+                                font-size:.59rem;
+                                font-weight:850;
+                            ">
+                                {position:02d}
+                            </div>
+                            """
+                        )
+
+                    with merchant_col_inner:
+
+                        clicked = st.button(
+                            merchant_name,
+                            key=(
+                                "ma_top_ditto_"
+                                f"{position}_"
+                                f"{safe_key}"
+                            ),
+                            width="stretch",
+                            help=(
+                                "Open transactions for "
+                                f"{merchant_name}"
+                            ),
+                        )
+
+                        if clicked:
+                            set_transaction_focus(
+                                "merchant",
+                                merchant_name,
+                            )
+                            st.rerun()
+
+                        st.html(
+                            f"""
+                            <div class="ma-ditto-rank-track">
+                                <div style="
+                                    width:{min(bar_width,100):.1f}%;
+                                    height:100%;
+                                    border-radius:999px;
+                                    background:#8B7CF6;
+                                "></div>
+                            </div>
+                            """
+                        )
+
+                with row_right:
+                    st.html(
+                        f"""
+                        <div class="ma-rank-meta ma-ditto-meta">
+                            <div class="ma-rank-amount">
+                                {money(amount, currency)}
+                            </div>
+                            <div class="ma-rank-share">
+                                {count:,} · {share:.1f}%
+                            </div>
+                        </div>
+                        """
+                    )
+
+    # ========================================================
+    # MERCHANT SHARE
+    # ========================================================
+
+    with share_col:
+
+        with st.container(
+            border=True,
+            key="merchant_analysis_share_reference",
+        ):
+
+            st.html("""
+            <div>
+                <div class="ma-panel-title">
+                    ◔ Merchant Share
+                </div>
+                <div class="ma-panel-subtitle">
+                    How this category is split across merchants.
+                </div>
+            </div>
+            """)
+
+            share_source = (
+                selected_df
+                .groupby(
+                    "Merchant",
+                    as_index=False,
+                )["Amount"]
+                .sum()
+                .sort_values(
+                    ["Amount", "Merchant"],
+                    ascending=[False, True],
+                )
+                .reset_index(drop=True)
+            )
+
+            if not share_source.empty:
+
+                share_rows = share_source.head(5)
+                others_amount = float(
+                    share_source.iloc[5:]["Amount"].sum()
+                )
+
+                labels = (
+                    share_rows["Merchant"]
+                    .astype(str)
+                    .tolist()
+                )
+                values = (
+                    share_rows["Amount"]
+                    .astype(float)
+                    .tolist()
+                )
+
+                if others_amount > 0:
+                    labels.append("Others")
+                    values.append(others_amount)
+
+                share_colors = [
+                    "#F45B86",
+                    "#F5A16F",
+                    "#F7C85D",
+                    "#47D3A7",
+                    "#62A7F4",
+                    "#9A8AFB",
+                ]
+
+                donut_col, legend_col = st.columns(
+                    [.83, 1.17],
+                    gap="small",
+                )
+
+                with donut_col:
+
+                    donut = go.Figure(
+                        go.Pie(
+                            labels=labels,
+                            values=values,
+                            hole=.62,
+                            sort=False,
+                            direction="clockwise",
+                            textinfo="none",
+                            marker=dict(
+                                colors=share_colors[
+                                    :len(labels)
+                                ],
+                                line=dict(
+                                    color="#0A111C",
+                                    width=2,
+                                ),
+                            ),
+                            hovertemplate=(
+                                "%{label}<br>"
+                                + currency
+                                + " %{value:,.2f} · %{percent}"
+                                + "<extra></extra>"
+                            ),
+                        )
+                    )
+
+                    donut.update_layout(
+                        height=220,
+                        margin=dict(
+                            l=0,
+                            r=0,
+                            t=2,
+                            b=2,
+                        ),
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        showlegend=False,
+                        font=dict(
+                            color="#94A3B8",
+                            size=8,
+                        ),
+                    )
+
+                    donut.add_annotation(
+                        x=.5,
+                        y=.5,
+                        text=(
+                            f"<span style='font-size:8px;'>"
+                            f"{escape(currency)}"
+                            f"</span><br>"
+                            f"<b>{selected_total:,.2f}</b>"
+                        ),
+                        showarrow=False,
+                        font=dict(
+                            color="#F8FAFC",
+                            size=13,
+                        ),
+                    )
+
+                    st.plotly_chart(
+                        donut,
+                        width="stretch",
+                        config={
+                            "displayModeBar": False,
+                        },
+                        key="ma_merchant_share_figure_reference",
+                    )
+
+                with legend_col:
+
+                    for label, value, chart_color in zip(
+                        labels,
+                        values,
+                        share_colors,
+                    ):
+
+                        percentage = (
+                            value
+                            / selected_total
+                            * 100
+                            if selected_total
+                            else 0.0
+                        )
+
+                        st.html(
+                            f"""
+                            <div class="ma-share-row">
+                                <div class="ma-share-label">
+                                    <span
+                                        class="ma-share-dot"
+                                        style="background:{chart_color};"
+                                    ></span>
+                                    <span style="
+                                        overflow:hidden;
+                                        text-overflow:ellipsis;
+                                        white-space:nowrap;
+                                    ">
+                                        {escape(label)}
+                                    </span>
+                                </div>
+                                <span class="ma-share-pct">
+                                    {percentage:.1f}%
+                                </span>
+                            </div>
+                            """
+                        )
+
+            else:
+                st.info(
+                    "No merchant distribution is available."
+                )
+
+    # ========================================================
+    # ONE-LINE INTERPRETATION
+    # ========================================================
+
+    top_share = (
+        float(
+            top_category_merchants.iloc[0]["Amount"]
+        )
+        / selected_total
+        * 100
+        if not top_category_merchants.empty
+        and selected_total
+        else 0.0
+    )
+
+    st.html(
+        f"""
+        <div style="
+            margin-top:12px;
+            color:#64748b;
+            font-size:.67rem;
+            text-align:center;
+        ">
+            {escape(selected_category)} represents
+            <strong style="color:#cbd5e1;">
+                {selected_share:.1f}%
+            </strong>
+            of outgoing spending, with
+            <strong style="color:#cbd5e1;">
+                {escape(top_merchant_name)}
+            </strong>
+            contributing
+            <strong style="color:#cbd5e1;">
+                {top_share:.1f}%
+            </strong>
+            of this category.
+        </div>
+        """
+    )
+
+    render_floating_finora_chat(
+        transactions
+    )
+
+
 
 
 
@@ -7258,6 +9784,14 @@ if st.session_state.page == "Transactions":
         "text/csv",
         key="download_transactions_v2",
     )
+
+
+# ============================================================
+# MERCHANT ANALYSIS PAGE ROUTE
+# ============================================================
+
+if st.session_state.page == "Merchant Analysis":
+    render_merchant_analysis_page(transactions)
 
 
 # ============================================================

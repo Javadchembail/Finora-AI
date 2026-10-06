@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_left
 import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -444,7 +445,10 @@ class UniversalRowExtractor:
             )
 
         def rowize(page_words):
-            return self._group_rows(page_words)
+            # page_words are sorted by top/x0 immediately below.  Avoid the
+            # generic O(n log n) sort + row scan here; this hot path can be
+            # called for every PDF page.
+            return self._group_rows_sorted(page_words)
 
         def date_anchors(page_words, column):
             """
@@ -582,6 +586,14 @@ class UniversalRowExtractor:
                 ),
             )
 
+            # The page is sorted by top, so this lets transaction regions be
+            # sliced with binary search instead of scanning the entire page
+            # once for every transaction boundary.
+            page_tops = [
+                float(word.get("top", 0))
+                for word in page_words
+            ]
+
             rows = rowize(page_words)
 
             tx_date_column = None
@@ -598,6 +610,54 @@ class UniversalRowExtractor:
                     key=self._column_center,
                 )
                 value_date_column = sorted_dates[1]
+
+            # Pre-index complete and split date candidates by physical row.
+            # The previous implementation rescanned the entire page for every
+            # transaction when looking for a value date. On a 215-transaction
+            # page that creates a large amount of repeated work.
+            row_date_candidates = {}
+            if value_date_column is not None:
+                value_center = self._column_center(value_date_column)
+
+                for physical_row in rows:
+                    if not physical_row:
+                        continue
+
+                    row_top = float(physical_row[0].get("top", 0))
+                    candidates = []
+
+                    for word in physical_row:
+                        text = str(word.get("text", "")).strip()
+                        if not text:
+                            continue
+                        parsed = self._parse_date_text(text)
+                        if parsed is None:
+                            continue
+                        _, _, _, _, center = token_geometry(word)
+                        if abs(center - value_center) <= 90:
+                            candidates.append((center, parsed))
+
+                    # Preserve the original split-date fallback, but perform
+                    # it once for the whole page instead of once per row.
+                    row_date_candidates[row_top] = candidates
+
+                split_groups = self._find_date_groups(
+                    page_words,
+                    [value_date_column],
+                )
+                for group in split_groups:
+                    indexes = group.get("indexes", [])
+                    if not indexes:
+                        continue
+                    first = page_words[indexes[0]]
+                    row_top = float(first.get("top", 0))
+                    distance = abs(
+                        float(group.get("center", 0)) - value_center
+                    )
+                    if distance <= 90:
+                        row_date_candidates.setdefault(row_top, []).append(
+                            (float(group.get("center", value_center)), group["value"])
+                        )
 
             tx_date_anchors = (
                 date_anchors(
@@ -743,15 +803,19 @@ class UniversalRowExtractor:
                 else:
                     end = float("inf")
 
-                region = [
-                    word
-                    for word in page_words
-                    if (
-                        start - self.ROW_TOLERANCE
-                        <= float(word.get("top", 0))
-                        < end - self.ROW_TOLERANCE
+                region_start = bisect_left(
+                    page_tops,
+                    start - self.ROW_TOLERANCE,
+                )
+                if end == float("inf"):
+                    region_end = len(page_words)
+                else:
+                    region_end = bisect_left(
+                        page_tops,
+                        end - self.ROW_TOLERANCE,
                     )
-                ]
+
+                region = page_words[region_start:region_end]
 
                 if not region:
                     continue
@@ -775,11 +839,20 @@ class UniversalRowExtractor:
                 # first physical line.  If it is blank, inherit the last
                 # available value date anchor rather than guessing.
                 if value_date_column is not None:
-                    value_date = nearest_date_on_row(
-                        page_words,
-                        value_date_column,
+                    value_date = None
+                    row_candidates = row_date_candidates.get(
                         boundary["top"],
+                        (),
                     )
+                    if row_candidates:
+                        center = self._column_center(value_date_column)
+                        nearby = [
+                            (abs(word_center - center), parsed)
+                            for word_center, parsed in row_candidates
+                            if abs(word_center - center) <= 90
+                        ]
+                        if nearby:
+                            value_date = min(nearby, key=lambda item: item[0])[1]
 
                     if value_date is not None:
                         row["value_date"] = value_date
@@ -901,11 +974,18 @@ class UniversalRowExtractor:
                         )
                     ) - 8.0
 
+                    has_explicit_debit_credit = any(
+                        c.get("semantic_type") in {"debit", "credit"}
+                        for c in amount_columns
+                    )
                     numeric_left_candidates = [
                         float(c.get("x0", 0))
                         for c in amount_columns
-                        if c.get("semantic_type")
-                        != "balance"
+                        if c.get("semantic_type") != "balance"
+                        and (
+                            not has_explicit_debit_credit
+                            or c.get("semantic_type") in {"debit", "credit"}
+                        )
                     ]
 
                     desc_right = (
@@ -941,7 +1021,7 @@ class UniversalRowExtractor:
                 # on the same PDF page.  They can be physically inside the
                 # description column, so filter them by physical line rather
                 # than letting them poison the transaction.
-                description_rows = self._group_rows(region)
+                description_rows = self._group_rows_sorted(region)
                 metadata_started = False
 
                 for physical_row in description_rows:
@@ -1199,43 +1279,35 @@ class UniversalRowExtractor:
     # ROW GROUPING
     # =============================================================
 
-    def _group_rows(
-        self,
-        words,
-    ):
+    def _group_rows_sorted(self, words):
+        """
+        Group words that are already sorted by top/x0.
 
-        words = sorted(
-            words,
-            key=lambda word: (
-                float(word.get("top", 0)),
-                float(word.get("x0", 0)),
-            ),
-        )
+        The previous implementation compared every word with every existing
+        row.  Because the words are ordered by top, only the most recent row
+        can possibly satisfy ROW_TOLERANCE.  This preserves the grouping
+        rule while making the hot path linear.
+        """
+        if not words:
+            return []
 
         rows = []
+        current_row = None
+        current_top = None
 
         for word in words:
+            top = float(word.get("top", 0))
 
-            top = float(
-                word.get("top", 0)
-            )
-
-            matched_row = None
-
-            for row in rows:
-
-                row_top = float(
-                    row[0].get("top", 0)
-                )
-
-                if abs(top - row_top) <= self.ROW_TOLERANCE:
-                    matched_row = row
-                    break
-
-            if matched_row is None:
-                rows.append([word])
+            if (
+                current_row is None
+                or current_top is None
+                or abs(top - current_top) > self.ROW_TOLERANCE
+            ):
+                current_row = [word]
+                current_top = top
+                rows.append(current_row)
             else:
-                matched_row.append(word)
+                current_row.append(word)
 
         for row in rows:
             row.sort(
@@ -1245,6 +1317,29 @@ class UniversalRowExtractor:
             )
 
         return rows
+
+    def _group_rows(
+        self,
+        words,
+    ):
+        """
+        Group words into physical rows.
+
+        This public/internal generic path keeps the original behavior for
+        callers that may provide unsorted words.  The bank-shaped hot path
+        uses _group_rows_sorted() after sorting once.
+        """
+        if not words:
+            return []
+
+        sorted_words = sorted(
+            words,
+            key=lambda word: (
+                float(word.get("top", 0)),
+                float(word.get("x0", 0)),
+            ),
+        )
+        return self._group_rows_sorted(sorted_words)
 
     # =============================================================
     # ROW PARSING
@@ -1847,11 +1942,50 @@ class UniversalRowExtractor:
         if not text:
             return None
 
+        # Date parsing is one of the hottest operations in the extractor.
+        # The old implementation attempted datetime.strptime() against all
+        # supported formats for virtually every PDF word.  Most statement
+        # words are obviously not dates, so reject non-date-shaped tokens
+        # before entering the expensive datetime parser.
+        cache = getattr(self, "_date_parse_cache", None)
+        if cache is None:
+            cache = {}
+            self._date_parse_cache = cache
+
+        cached = cache.get(text)
+        if cached is not None or text in cache:
+            return cached
+
         text = re.sub(
             r"\s+",
             " ",
             text,
         )
+
+        if len(text) < 4 or len(text) > 32:
+            cache[str(value).strip()] = None
+            return None
+
+        has_digit = any(ch.isdigit() for ch in text)
+        if not has_digit:
+            cache[str(value).strip()] = None
+            return None
+
+        lower_text = text.lower().rstrip(".")
+        has_month_word = any(
+            re.search(rf"\b{re.escape(month)}\b", lower_text)
+            for month in self.MONTHS
+        )
+        has_numeric_separator = bool(
+            re.search(r"\d\s*[/.-]\s*\d", text)
+        )
+        has_numeric_month_shape = bool(
+            re.fullmatch(r"\d{1,2}\s+\d{1,2}(?:\s+\d{2,4})?", text)
+        )
+
+        if not (has_month_word or has_numeric_separator or has_numeric_month_shape):
+            cache[str(value).strip()] = None
+            return None
 
         # Normalize common separators.
         normalized = re.sub(
@@ -1888,9 +2022,9 @@ class UniversalRowExtractor:
                     fmt,
                 )
 
-                return parsed.strftime(
-                    "%Y-%m-%d"
-                )
+                result = parsed.strftime("%Y-%m-%d")
+                cache[str(value).strip()] = result
+                return result
 
             except ValueError:
                 continue
@@ -1925,11 +2059,11 @@ class UniversalRowExtractor:
                         month,
                         day,
                     ):
-                        return (
-                            f"{year:04d}-"
-                            f"{month:02d}-"
-                            f"{day:02d}"
+                        result = (
+                            f"{year:04d}-{month:02d}-{day:02d}"
                         )
+                        cache[str(value).strip()] = result
+                        return result
 
         # Two-token textual date: 09 AUG
         #
@@ -1955,10 +2089,11 @@ class UniversalRowExtractor:
                 day = int(first)
 
                 if 1 <= day <= 31:
-                    return (
-                        f"0001-{month:02d}-"
-                        f"{day:02d}"
-                    )
+                    result = f"0001-{month:02d}-{day:02d}"
+                    cache[str(value).strip()] = result
+                    return result
+
+        cache[str(value).strip()] = None
 
         return None
 

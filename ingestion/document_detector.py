@@ -112,12 +112,12 @@ class DocumentDetector:
     CURRENCY_PATTERNS = {
         "AED": [
             r"\bAED\b",
-            r"Ø¯\.Ø¥",
-            r"Ø¯Ø±Ù‡Ù…",
+            r"Ã˜Â¯\.Ã˜Â¥",
+            r"Ã˜Â¯Ã˜Â±Ã™â€¡Ã™â€¦",
         ],
         "INR": [
             r"\bINR\b",
-            r"â‚¹",
+            r"Ã¢â€šÂ¹",
             r"\bRs\.?\b",
             r"\bRupees?\b",
             r"\bIndian Rupees?\b",
@@ -130,12 +130,12 @@ class DocumentDetector:
         ],
         "EUR": [
             r"\bEUR\b",
-            r"â‚¬",
+            r"Ã¢â€šÂ¬",
             r"\bEuros?\b",
         ],
         "GBP": [
             r"\bGBP\b",
-            r"Â£",
+            r"Ã‚Â£",
             r"\bPounds?\b",
         ],
         "SAR": [
@@ -182,7 +182,39 @@ class DocumentDetector:
         "OMR": "Oman",
     }
 
-    def detect(
+    def detect(self, pages: List[dict]) -> DocumentMetadata:
+        """Detect statement metadata with a fast-first-page strategy.
+
+        Most financial statements expose their identity, currency, period, and
+        transaction headers on the first few pages. We scan those pages first.
+        If the result is not sufficiently complete, the original full-document
+        detector is used as a correctness-preserving fallback.
+        """
+        if not pages:
+            return DocumentMetadata(page_count=0)
+
+        fast_pages = pages[:6]
+        result = self._detect_text(fast_pages)
+        result.page_count = len(pages)
+
+        # A complete result means the fast scan found all four core signals.
+        # In that case there is no reason to rescan a large statement.
+        if (
+            result.confidence >= 0.75
+            and result.document_type != "unknown"
+            and result.statement_type != "unknown"
+            and result.currency is not None
+            and result.has_transaction_table
+        ):
+            return result
+
+        # Unusual statements may put their useful metadata later in the PDF.
+        # Preserve the original full-document behavior as the safe fallback.
+        result = self._detect_text(pages)
+        result.page_count = len(pages)
+        return result
+
+    def _detect_text(
         self,
         pages: List[dict],
     ) -> DocumentMetadata:

@@ -5,7 +5,7 @@ from ingestion.pipeline import FinancialStatementPipeline
 # PDF CONFIGURATION
 # =========================================================
 
-PDF_PATH = "storage/federal_statement.pdf"
+PDF_PATH = "storage/jd new.pdf"
 
 PASSWORD = input("Enter PDF password: ").strip()
 

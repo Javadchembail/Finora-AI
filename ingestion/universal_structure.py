@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-import re
 import pdfplumber
 
 from ingestion.semantic_mapper import SemanticHeaderMapper
@@ -31,32 +30,32 @@ class UniversalStructureDetector:
         - column orders
         - header terminology
 
-    Pipeline:
+    Architecture:
 
         PDF words
             ↓
-        Header candidate detection
+        Candidate semantic words
             ↓
         Header-band detection
             ↓
-        Multi-word header reconstruction
+        Multi-line header reconstruction
             ↓
         Semantic mapping
-            ↓
-        Duplicate/conflict resolution
             ↓
         Transaction structure
     """
 
     WORD_ROW_TOLERANCE = 4.0
 
+    # Maximum distance between stacked words belonging to the
+    # same logical header.
     MULTILINE_MAX_VERTICAL_GAP = 18.0
 
+    # Header-band tolerance around the strongest header row.
     HEADER_BAND_TOLERANCE = 14.0
 
+    # Horizontal overlap required for vertically stacked words.
     MIN_HORIZONTAL_OVERLAP_RATIO = 0.55
-
-    HORIZONTAL_HEADER_GAP = 24.0
 
     CORE_DATE_TYPES = {
         "transaction_date",
@@ -70,74 +69,12 @@ class UniversalStructureDetector:
         "credit",
     }
 
-    ARTIFACT_HEADERS = {
-        "DR",
-        "CR",
-        "/CR",
-        "/DR",
-        "DR/CR",
-        "CR/DR",
-    }
-
-    COMPOSITE_HEADERS = {
-        "value date": "value_date",
-        "posting date": "posting_date",
-        "post date": "posting_date",
-        "transaction date": "transaction_date",
-        "tran date": "transaction_date",
-        "txn date": "transaction_date",
-        "trans date": "transaction_date",
-        "entry date": "transaction_date",
-        "booking date": "transaction_date",
-        "effective date": "value_date",
-
-        "transaction id": "transaction_id",
-        "transaction no": "transaction_id",
-        "transaction number": "transaction_id",
-        "txn id": "transaction_id",
-        "txn no": "transaction_id",
-        "txn number": "transaction_id",
-        "tran id": "transaction_id",
-        "tran no": "transaction_id",
-        "reference number": "transaction_id",
-        "reference no": "transaction_id",
-        "ref no": "transaction_id",
-        "trace id": "transaction_id",
-        "trace number": "transaction_id",
-        "confirmation number": "transaction_id",
-
-        "transaction type": "transaction_type",
-        "tran type": "transaction_type",
-        "txn type": "transaction_type",
-
-        "transaction description": "description",
-        "transaction details": "description",
-        "account description": "description",
-        "account details": "description",
-
-        "transaction amount": "amount",
-
-        "amount out": "debit",
-        "money out": "debit",
-        "payment out": "debit",
-        "paid out": "debit",
-
-        "amount in": "credit",
-        "money in": "credit",
-        "payment in": "credit",
-        "paid in": "credit",
-
-        "closing balance": "balance",
-        "running balance": "balance",
-        "available balance": "balance",
-        "current balance": "balance",
-        "account balance": "balance",
-        "ledger balance": "balance",
-        "book balance": "balance",
-    }
-
     def __init__(self):
         self.mapper = SemanticHeaderMapper()
+        # Cache semantic header lookups because statement PDFs repeat the
+        # same header vocabulary across pages and rows. Both successful and
+        # unsuccessful lookups are cached.
+        self._semantic_cache = {}
 
     # ================================================================
     # PUBLIC API
@@ -189,10 +126,6 @@ class UniversalStructureDetector:
                 key=lambda result: (
                     result["score"],
                     len(result["columns"]),
-                    result.get(
-                        "transaction_rows",
-                        0,
-                    ),
                 ),
                 reverse=True,
             )
@@ -208,11 +141,9 @@ class UniversalStructureDetector:
         words: List[Dict],
         page_number: int,
     ) -> Optional[Dict]:
-
-        normalized_words = self._normalize_words(
-            words
-        )
-
+        # Normalize once per page. The previous implementation normalized
+        # the same word list again inside the primary detector.
+        normalized_words = self._normalize_words(words)
         if not normalized_words:
             return None
 
@@ -220,18 +151,18 @@ class UniversalStructureDetector:
             normalized_words,
             page_number,
         )
-
         if primary is not None:
             return primary
+
+        # Fragmented detection is deliberately expensive. Do not run it on
+        # pages that contain no plausible financial-header vocabulary.
+        if not self._has_financial_header_signal(normalized_words):
+            return None
 
         return self._detect_fragmented_table(
             normalized_words,
             page_number,
         )
-
-    # ================================================================
-    # PRIMARY DETECTOR
-    # ================================================================
 
     def _detect_page_primary(
         self,
@@ -239,64 +170,78 @@ class UniversalStructureDetector:
         page_number: int,
     ) -> Optional[Dict]:
 
-        semantic_words = self._map_individual_words(
-            words
+        normalized_words = words
+
+        if not normalized_words:
+            return None
+
+        # ------------------------------------------------------------
+        # STEP 1
+        # Find candidate semantic words throughout the page.
+        # ------------------------------------------------------------
+
+        semantic_words = (
+            self._map_individual_words(
+                normalized_words
+            )
         )
 
         if not semantic_words:
             return None
 
-        header_words = self._find_header_band(
-            semantic_words
+        # ------------------------------------------------------------
+        # STEP 2
+        # Identify the most likely transaction-header band.
+        #
+        # IMPORTANT:
+        # Multiline reconstruction happens ONLY inside this band.
+        #
+        # This prevents a header word from being accidentally combined
+        # with a transaction-row word.
+        # ------------------------------------------------------------
+
+        header_words = (
+            self._find_header_band(
+                semantic_words
+            )
         )
 
         if not header_words:
             return None
 
-        header_top = min(
-            word["top"]
-            for word in header_words
-        )
-
-        expanded_header_words = []
-
-        for word in words:
-
-            if abs(
-                word["top"] - header_top
-            ) <= self.HEADER_BAND_TOLERANCE:
-
-                expanded_header_words.append(
-                    word
-                )
-
-        if not expanded_header_words:
-            expanded_header_words = header_words
+        # ------------------------------------------------------------
+        # STEP 3
+        # Reconstruct vertically stacked headers.
+        # ------------------------------------------------------------
 
         logical_headers = (
             self._reconstruct_headers(
-                expanded_header_words
+                header_words
             )
         )
+
+        # ------------------------------------------------------------
+        # STEP 4
+        # Map reconstructed headers.
+        # ------------------------------------------------------------
 
         candidates = []
 
         for item in logical_headers:
 
-            header = self._clean_header(
-                item["header"]
-            )
+            header = item["header"].strip()
 
             if not header:
                 continue
 
-            if self._is_artifact_header(
-                header
-            ):
+            if header.upper() in {
+                "DR",
+                "CR",
+            }:
                 continue
 
             semantic_type, confidence = (
-                self._map_header(
+                self._map_header_cached(
                     header
                 )
             )
@@ -320,6 +265,11 @@ class UniversalStructureDetector:
         if not candidates:
             return None
 
+        # ------------------------------------------------------------
+        # STEP 5
+        # Select strongest transaction structure.
+        # ------------------------------------------------------------
+
         region = (
             self._select_transaction_columns(
                 candidates
@@ -328,6 +278,11 @@ class UniversalStructureDetector:
 
         if not region:
             return None
+
+        # ------------------------------------------------------------
+        # STEP 6
+        # Final score.
+        # ------------------------------------------------------------
 
         score = self._structure_score(
             region
@@ -369,118 +324,581 @@ class UniversalStructureDetector:
         }
 
     # ================================================================
-    # HEADER MAPPING
+    # FRAGMENTED TABLE FALLBACK
     # ================================================================
 
-    def _map_header(
+    def _detect_fragmented_table(
         self,
-        header: str,
-    ) -> Tuple[Optional[str], float]:
+        words: List[Dict],
+        page_number: int,
+    ) -> Optional[Dict]:
+        """Generic fallback for physically fragmented financial table headers.
 
-        normalized = self._normalize_header(
-            header
-        )
+        The fallback deliberately uses document geometry plus generic financial
+        vocabulary. It never checks a bank name or a bank-specific layout.
+        """
+        rows = self._group_words_by_top(words)
+        if len(rows) < 3:
+            return None
 
-        if not normalized:
-            return None, 0.0
+        # Build candidate header bands from nearby physical rows. A PDF can
+        # place a header on one line, two lines, or several aligned lines.
+        candidate_bands = []
+        for start in range(len(rows)):
+            for end in range(start, min(len(rows), start + 4)):
+                band_words = []
+                for idx in range(start, end + 1):
+                    band_words.extend(rows[idx])
+                mapped = self._map_fragmented_header_words(band_words)
+                if not mapped:
+                    continue
+                columns = self._build_fragmented_columns(mapped)
+                if not columns:
+                    continue
+                semantics = {c.semantic_type for c in columns}
+                if not semantics.intersection(self.CORE_DATE_TYPES):
+                    continue
+                if not (semantics.intersection(self.AMOUNT_TYPES) or "description" in semantics):
+                    continue
+                candidate_bands.append((start, end, columns))
 
-        composite = self.COMPOSITE_HEADERS.get(
-            normalized
-        )
+        if not candidate_bands:
+            return None
 
-        if composite:
-            return composite, 0.99
+        best = None
+        for start, end, columns in candidate_bands:
+            transaction_rows = self._count_transaction_evidence(rows, end, columns)
+            if transaction_rows < 2:
+                continue
 
-        semantic_type, confidence = (
-            self.mapper.map_header_with_confidence(
-                header
-            )
-        )
+            score = self._fragmented_structure_score(columns, transaction_rows)
+            candidate = (score, transaction_rows, len(columns), start, end, columns)
+            if best is None or candidate[:5] > best[:5]:
+                best = candidate
 
-        if semantic_type:
-            return (
-                semantic_type,
-                float(confidence),
-            )
+        if best is None:
+            return None
 
-        alias = self._generic_header_alias(
-            normalized
-        )
+        score, transaction_rows, _, start, end, columns = best
+        return {
+            "detected": True,
+            "page": page_number,
+            "columns": [
+                {
+                    "header": c.header,
+                    "semantic_type": c.semantic_type,
+                    "x0": round(c.x0, 2),
+                    "x1": round(c.x1, 2),
+                    "top": round(c.top, 2),
+                    "confidence": round(c.confidence, 4),
+                }
+                for c in sorted(columns, key=lambda item: item.x0)
+            ],
+            "score": round(score, 4),
+            "structure_score": round(self._structure_score(columns), 4),
+            "transaction_evidence": round(min(transaction_rows / 5.0, 1.0), 4),
+            "transaction_rows": transaction_rows,
+            "repeated_rows": transaction_rows,
+            "header_top": round(min(rows[i][0]["top"] for i in range(start, end + 1)), 2),
+        }
 
-        if alias:
-            return alias, 0.90
-
-        return None, 0.0
-
-    def _generic_header_alias(
+    def _group_words_by_top(
         self,
-        normalized: str,
-    ) -> Optional[str]:
+        words: List[Dict],
+    ) -> List[List[Dict]]:
+        rows: List[List[Dict]] = []
+        for word in sorted(words, key=lambda item: (item["top"], item["x0"])):
+            placed = False
+            for row in rows:
+                average_top = sum(item["top"] for item in row) / len(row)
+                if abs(word["top"] - average_top) <= self.WORD_ROW_TOLERANCE:
+                    row.append(word)
+                    placed = True
+                    break
+            if not placed:
+                rows.append([word])
+        for row in rows:
+            row.sort(key=lambda item: item["x0"])
+        return rows
 
+    def _map_fragmented_header_words(
+        self,
+        row: List[Dict],
+    ) -> List[Dict]:
+        mapped = []
+        for word in row:
+            text = str(word["text"]).strip()
+            if not text or text.upper() in {"DR", "CR", "/CR"}:
+                continue
+
+            semantic_type, confidence = self._map_header_cached(text)
+            semantic_type = semantic_type or self._generic_header_alias(text)
+            if not semantic_type:
+                continue
+
+            mapped.append({
+                **word,
+                "semantic_type": semantic_type,
+                "confidence": float(confidence if confidence else 0.90),
+            })
+        return mapped
+
+    def _generic_header_alias(self, text: str) -> Optional[str]:
+        """Small universal vocabulary for common statement terminology."""
+        normalized = " ".join(str(text).lower().replace("/", " ").split())
         aliases = {
-
-            # Description
             "particulars": "description",
             "narration": "description",
             "narrative": "description",
             "details": "description",
             "description": "description",
-            "remarks": "description",
-            "memo": "description",
-            "merchant": "description",
-            "payee": "description",
-            "beneficiary": "description",
-
-            # Debit
             "withdrawal": "debit",
             "withdrawals": "debit",
             "debit": "debit",
             "debits": "debit",
-
-            # Credit
             "deposit": "credit",
             "deposits": "credit",
             "credit": "credit",
             "credits": "credit",
-
-            # Balance
             "balance": "balance",
-
-            # Dates
+            "closing balance": "balance",
+            "running balance": "balance",
+            "available balance": "balance",
             "date": "transaction_date",
             "transaction date": "transaction_date",
             "tran date": "transaction_date",
             "txn date": "transaction_date",
+            "value date": "value_date",
             "posting date": "posting_date",
             "post date": "posting_date",
-            "value date": "value_date",
-
-            # Amount
-            "amount": "amount",
-
-            # Transaction ID
+            "tran id": "transaction_id",
+            "txn id": "transaction_id",
+            "transaction id": "transaction_id",
             "reference": "transaction_id",
             "reference no": "transaction_id",
             "reference number": "transaction_id",
-            "transaction id": "transaction_id",
-            "transaction no": "transaction_id",
-            "transaction number": "transaction_id",
-            "txn id": "transaction_id",
-            "txn no": "transaction_id",
-            "tran id": "transaction_id",
-
-            # Transaction type
-            "transaction type": "transaction_type",
-            "tran type": "transaction_type",
-            "txn type": "transaction_type",
+            "amount": "amount",
+            "transaction amount": "amount",
+            "money out": "debit",
+            "money in": "credit",
         }
+        return aliases.get(normalized)
 
-        return aliases.get(
-            normalized
-        )
+    def _fragmented_row_score(self, semantics: set) -> float:
+        score = 0.0
+        if semantics.intersection(self.CORE_DATE_TYPES):
+            score += 2.0
+        if "description" in semantics:
+            score += 2.0
+        if semantics.intersection(self.AMOUNT_TYPES):
+            score += 2.0
+        if "balance" in semantics:
+            score += 1.5
+        if "transaction_id" in semantics:
+            score += 0.75
+        if "value_date" in semantics or "posting_date" in semantics:
+            score += 0.5
+        return score
+
+    def _build_fragmented_columns(
+        self,
+        mapped_words: List[Dict],
+    ) -> List[DetectedColumn]:
+        """
+        Merge only adjacent header words that share a column region.
+        This specifically handles headers such as Value + Date and
+        Tran + ID without hardcoding a bank layout.
+        """
+        if not mapped_words:
+            return []
+
+        ordered = sorted(mapped_words, key=lambda item: (item["x0"], item["top"]))
+        groups: List[List[Dict]] = []
+
+        for word in ordered:
+            best_group = None
+            best_distance = None
+            center = (word["x0"] + word["x1"]) / 2.0
+
+            for group in groups:
+                group_x0 = min(item["x0"] for item in group)
+                group_x1 = max(item["x1"] for item in group)
+                group_center = (group_x0 + group_x1) / 2.0
+                distance = abs(center - group_center)
+
+                # A multi-line header normally stays inside the same
+                # horizontal column. The tolerance is deliberately
+                # generous enough for different PDF font metrics.
+                tolerance = max(18.0, (group_x1 - group_x0) * 1.5)
+                if distance <= tolerance and (
+                    best_distance is None or distance < best_distance
+                ):
+                    best_group = group
+                    best_distance = distance
+
+            if best_group is None:
+                groups.append([word])
+            else:
+                best_group.append(word)
+
+        columns: List[DetectedColumn] = []
+        for group in groups:
+            group.sort(key=lambda item: (item["top"], item["x0"]))
+            texts = [item["text"] for item in group]
+
+            # Try the combined phrase first. If it is not recognized,
+            # choose the strongest semantic token in that physical
+            # column.
+            combined = " ".join(texts).strip()
+            semantic_type, confidence = self._map_header_cached(combined)
+            semantic_type = semantic_type or self._generic_header_alias(combined)
+
+            if semantic_type is None:
+                ranked = sorted(
+                    group,
+                    key=lambda item: item["confidence"],
+                    reverse=True,
+                )
+                chosen = ranked[0]
+                semantic_type = chosen["semantic_type"]
+                confidence = chosen["confidence"]
+                header = chosen["text"]
+            else:
+                header = combined
+
+            columns.append(
+                DetectedColumn(
+                    header=header,
+                    semantic_type=semantic_type,
+                    x0=min(item["x0"] for item in group),
+                    x1=max(item["x1"] for item in group),
+                    top=min(item["top"] for item in group),
+                    confidence=float(confidence or 0.90),
+                )
+            )
+
+        # Keep one physical column per semantic role at nearby x
+        # positions. Distinct debit/credit/balance columns are retained.
+        deduped: List[DetectedColumn] = []
+        for column in sorted(columns, key=lambda item: item.x0):
+            duplicate = None
+            center = (column.x0 + column.x1) / 2.0
+            for index, existing in enumerate(deduped):
+                if existing.semantic_type != column.semantic_type:
+                    continue
+                existing_center = (existing.x0 + existing.x1) / 2.0
+                if abs(existing_center - center) <= 15.0:
+                    duplicate = index
+                    break
+            if duplicate is None:
+                deduped.append(column)
+            elif column.confidence > deduped[duplicate].confidence:
+                deduped[duplicate] = column
+
+        semantics = {column.semantic_type for column in deduped}
+        has_date = bool(semantics.intersection(self.CORE_DATE_TYPES))
+        has_money = bool(semantics.intersection(self.AMOUNT_TYPES))
+        has_description = "description" in semantics
+
+        if not has_date or not (has_money or has_description):
+            return []
+
+        return deduped
+
+    def _count_transaction_evidence(
+        self,
+        rows: List[List[Dict]],
+        header_end: int,
+        columns: List[DetectedColumn],
+    ) -> int:
+        """Count repeated transaction-like rows after the header.
+
+        Financial PDFs frequently wrap descriptions onto continuation lines,
+        so this method only requires a date plus at least one numeric amount on
+        the first physical line of a transaction.
+        """
+        if header_end >= len(rows) - 1:
+            return 0
+
+        count = 0
+        for row in rows[header_end + 1:]:
+            joined = " ".join(str(item["text"]) for item in row).strip()
+            if not joined:
+                continue
+
+            lower = joined.casefold()
+            if any(term in lower for term in (
+                "opening balance",
+                "closing balance",
+                "balance forward",
+                "brought forward",
+                "carried forward",
+                "statement summary",
+            )):
+                continue
+
+            has_date = self._row_has_date(row, [])
+            numeric_count = sum(
+                1 for item in row if self._looks_numeric(item["text"])
+            )
+
+            if has_date and numeric_count >= 1:
+                count += 1
+                if count >= 100:
+                    break
+
+        return count
+
+    def _row_has_date(
+        self,
+        row: List[Dict],
+        date_columns: List[DetectedColumn],
+    ) -> bool:
+        for item in row:
+            text = str(item["text"]).strip()
+            if self._looks_like_date_token(text):
+                if not date_columns:
+                    return True
+                center = (item["x0"] + item["x1"]) / 2.0
+                nearest = min(
+                    date_columns,
+                    key=lambda column: abs(
+                        ((column.x0 + column.x1) / 2.0) - center
+                    ),
+                )
+                if abs(
+                    ((nearest.x0 + nearest.x1) / 2.0) - center
+                ) <= 85.0:
+                    return True
+        return False
+
+    def _looks_like_date_token(self, text: str) -> bool:
+        import re
+
+        value = str(text).strip().upper()
+        if not value:
+            return False
+
+        months = "JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC"
+        patterns = [
+            rf"^\d{{1,2}}[-/]({months})[-/]\d{{2,4}}$",
+            rf"^\d{{4}}[-/]({months})[-/]\d{{1,2}}$",
+            r"^\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}$",
+            r"^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}$",
+        ]
+        if any(re.match(pattern, value) for pattern in patterns):
+            return True
+
+        # Individual tokens used by split PDF dates, e.g. 31 + AUG + 2026.
+        if re.fullmatch(r"\d{1,2}", value):
+            number = int(value)
+            return 1 <= number <= 31
+        if value[:3] in months.split("|") and len(value) <= 9:
+            return True
+        if re.fullmatch(r"\d{4}", value):
+            year = int(value)
+            return 1900 <= year <= 2100
+        if re.fullmatch(r"\d{2}", value):
+            year = int(value)
+            return 0 <= year <= 99
+        return False
+
+    def _looks_numeric(self, text: str) -> bool:
+        value = str(text).strip().replace(",", "")
+        if value.startswith("(") and value.endswith(")"):
+            value = value[1:-1]
+        try:
+            float(value)
+            return True
+        except (TypeError, ValueError):
+            return False
+
+    def _fragmented_structure_score(
+        self,
+        columns: List[DetectedColumn],
+        transaction_rows: int,
+    ) -> float:
+        base = self._structure_score(columns)
+        evidence = min(transaction_rows / 10.0, 1.0)
+        return min((base * 0.65) + (evidence * 0.35), 1.0)
 
     # ================================================================
-    # HEADER BAND
+    # SEMANTIC MAPPING CACHE / FAST SCREENING
+    # ================================================================
+
+    def _map_header_cached(
+        self,
+        text: str,
+    ) -> Tuple[Optional[str], float]:
+        """Cache semantic mapper calls for repeated PDF vocabulary."""
+        key = " ".join(str(text).strip().casefold().split())
+        if not key:
+            return None, 0.0
+
+        cached = self._semantic_cache.get(key)
+        if cached is not None:
+            return cached
+
+        result = self.mapper.map_header_with_confidence(text)
+        if result is None:
+            result = (None, 0.0)
+        else:
+            semantic_type, confidence = result
+            result = (semantic_type, float(confidence or 0.0))
+
+        self._semantic_cache[key] = result
+        return result
+
+    def _has_financial_header_signal(
+        self,
+        words: List[Dict],
+    ) -> bool:
+        """Cheap universal vocabulary gate for fragmented-table fallback.
+
+        This gate never decides that a page *is* a statement. It only decides
+        whether the expensive fragmented fallback is worth attempting.
+        """
+        signals = {
+            "date",
+            "value",
+            "posting",
+            "post",
+            "transaction",
+            "trans",
+            "tran",
+            "txn",
+            "reference",
+            "ref",
+            "description",
+            "details",
+            "particulars",
+            "narration",
+            "amount",
+            "debit",
+            "credit",
+            "withdrawal",
+            "withdrawals",
+            "deposit",
+            "deposits",
+            "balance",
+            "opening",
+            "closing",
+        }
+
+        for word in words:
+            text = " ".join(
+                str(word.get("text", "")).casefold().split()
+            )
+            if text in signals:
+                return True
+
+        return False
+
+    # ================================================================
+    # NORMALIZE PDF WORDS
+    # ================================================================
+
+    def _normalize_words(
+        self,
+        words: List[Dict],
+    ) -> List[Dict]:
+
+        result = []
+
+        for word in words:
+
+            text = str(
+                word.get("text", "")
+            ).strip()
+
+            if not text:
+                continue
+
+            try:
+                x0 = float(
+                    word["x0"]
+                )
+
+                x1 = float(
+                    word["x1"]
+                )
+
+                top = float(
+                    word["top"]
+                )
+
+                bottom = float(
+                    word.get(
+                        "bottom",
+                        top,
+                    )
+                )
+
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+            result.append(
+                {
+                    "text": text,
+                    "x0": x0,
+                    "x1": x1,
+                    "top": top,
+                    "bottom": bottom,
+                }
+            )
+
+        return result
+
+    # ================================================================
+    # INDIVIDUAL SEMANTIC WORD MAPPING
+    # ================================================================
+
+    def _map_individual_words(
+        self,
+        words: List[Dict],
+    ) -> List[Dict]:
+
+        result = []
+
+        for word in words:
+
+            text = word["text"]
+
+            semantic_type, confidence = (
+                self._map_header_cached(
+                    text
+                )
+            )
+
+            if not semantic_type:
+                continue
+
+            # Very short generic words such as "Dr" and "Cr" are
+            # intentionally ignored here.
+            if text.upper() in {
+                "DR",
+                "CR",
+            }:
+                continue
+
+            result.append(
+                {
+                    **word,
+                    "semantic_type": semantic_type,
+                    "confidence": float(
+                        confidence
+                    ),
+                }
+            )
+
+        return result
+
+    # ================================================================
+    # HEADER BAND DETECTION
     # ================================================================
 
     def _find_header_band(
@@ -488,8 +906,35 @@ class UniversalStructureDetector:
         semantic_words: List[Dict],
     ) -> List[Dict]:
 
+        """
+        Find the densest horizontal semantic band.
+
+        A transaction header usually contains several semantic fields
+        close together:
+
+            Date
+            Description
+            Debit
+            Credit
+            Balance
+
+        This method identifies that band BEFORE multiline
+        reconstruction.
+
+        Therefore:
+
+            Value
+            Date
+
+        can be combined, while a transaction-row Date cannot.
+        """
+
         if not semantic_words:
             return []
+
+        # ------------------------------------------------------------
+        # Build top clusters.
+        # ------------------------------------------------------------
 
         clusters: List[List[Dict]] = []
 
@@ -520,15 +965,11 @@ class UniversalStructureDetector:
                     - average_top
                 ) <= self.HEADER_BAND_TOLERANCE:
 
-                    cluster.append(
-                        word
-                    )
-
+                    cluster.append(word)
                     placed = True
                     break
 
             if not placed:
-
                 clusters.append(
                     [word]
                 )
@@ -536,39 +977,48 @@ class UniversalStructureDetector:
         if not clusters:
             return []
 
-        scored = []
+        # ------------------------------------------------------------
+        # Score clusters.
+        # ------------------------------------------------------------
+
+        scored_clusters = []
 
         for cluster in clusters:
 
-            score = (
-                self._header_band_score(
-                    cluster
-                )
+            score = self._header_band_score(
+                cluster
             )
 
-            scored.append(
+            scored_clusters.append(
                 (
                     score,
-                    len(cluster),
                     cluster,
                 )
             )
 
-        scored.sort(
+        scored_clusters.sort(
             key=lambda item: (
                 item[0],
-                item[1],
+                len(item[1]),
             ),
             reverse=True,
         )
 
+        best_cluster = (
+            scored_clusters[0][1]
+        )
+
         return sorted(
-            scored[0][2],
+            best_cluster,
             key=lambda word: (
                 word["top"],
                 word["x0"],
             ),
         )
+
+    # ================================================================
+    # HEADER BAND SCORE
+    # ================================================================
 
     def _header_band_score(
         self,
@@ -582,30 +1032,37 @@ class UniversalStructureDetector:
 
         score = 0.0
 
+        # More semantic columns = stronger table-header evidence.
         score += min(
             len(words) * 0.12,
             0.60,
         )
 
+        # Date evidence.
         if semantics.intersection(
             self.CORE_DATE_TYPES
         ):
             score += 0.40
 
+        # Description evidence.
         if "description" in semantics:
             score += 0.40
 
+        # Monetary evidence.
         if semantics.intersection(
             self.AMOUNT_TYPES
         ):
             score += 0.40
 
+        # Balance evidence.
         if "balance" in semantics:
             score += 0.20
 
+        # Transaction ID evidence.
         if "transaction_id" in semantics:
             score += 0.10
 
+        # Average mapper confidence.
         if words:
 
             average_confidence = (
@@ -624,7 +1081,7 @@ class UniversalStructureDetector:
         return score
 
     # ================================================================
-    # HEADER RECONSTRUCTION
+    # MULTI-LINE HEADER RECONSTRUCTION
     # ================================================================
 
     def _reconstruct_headers(
@@ -632,8 +1089,29 @@ class UniversalStructureDetector:
         words: List[Dict],
     ) -> List[Dict]:
 
-        if not words:
-            return []
+        """
+        Reconstruct only words inside the already-selected
+        transaction-header band.
+
+        This is the critical difference from the previous version.
+
+        Example:
+
+            Value
+            Date
+
+        becomes:
+
+            Value Date
+
+        while:
+
+            Date
+            17 Jun 19
+
+        does NOT get combined because the transaction row is outside
+        the selected header band.
+        """
 
         words = sorted(
             words,
@@ -643,287 +1121,43 @@ class UniversalStructureDetector:
             ),
         )
 
-        horizontal_groups = (
-            self._build_horizontal_header_groups(
-                words
-            )
-        )
-
+        used = set()
         result = []
 
-        for group in horizontal_groups:
-
-            group = sorted(
-                group,
-                key=lambda word: (
-                    word["top"],
-                    word["x0"],
-                ),
-            )
-
-            texts = [
-                str(
-                    word["text"]
-                ).strip()
-                for word in group
-                if str(
-                    word["text"]
-                ).strip()
-            ]
-
-            if not texts:
-                continue
-
-            combined = " ".join(
-                texts
-            )
-
-            semantic_type, _ = (
-                self._map_header(
-                    combined
-                )
-            )
-
-            if semantic_type:
-
-                result.append(
-                    {
-                        "header": combined,
-                        "x0": min(
-                            word["x0"]
-                            for word in group
-                        ),
-                        "x1": max(
-                            word["x1"]
-                            for word in group
-                        ),
-                        "top": min(
-                            word["top"]
-                            for word in group
-                        ),
-                        "bottom": max(
-                            word["bottom"]
-                            for word in group
-                        ),
-                    }
-                )
-
-                continue
-
-            for word in group:
-
-                text = str(
-                    word["text"]
-                ).strip()
-
-                if not text:
-                    continue
-
-                if self._is_artifact_header(
-                    text
-                ):
-                    continue
-
-                result.append(
-                    {
-                        "header": text,
-                        "x0": word["x0"],
-                        "x1": word["x1"],
-                        "top": word["top"],
-                        "bottom": word["bottom"],
-                    }
-                )
-
-        return result
-
-    def _build_horizontal_header_groups(
-        self,
-        words: List[Dict],
-    ) -> List[List[Dict]]:
-
-        if not words:
-            return []
-
-        groups: List[List[Dict]] = []
-
-        ordered = sorted(
-            words,
-            key=lambda word: (
-                word["top"],
-                word["x0"],
-            ),
-        )
-
-        for word in ordered:
-
-            placed = False
-
-            for group in groups:
-
-                group_top = min(
-                    item["top"]
-                    for item in group
-                )
-
-                group_bottom = max(
-                    item["bottom"]
-                    for item in group
-                )
-
-                vertical_overlap = (
-                    min(
-                        word["bottom"],
-                        group_bottom,
-                    )
-                    - max(
-                        word["top"],
-                        group_top,
-                    )
-                )
-
-                if vertical_overlap <= 0:
-                    continue
-
-                group_x1 = max(
-                    item["x1"]
-                    for item in group
-                )
-
-                gap = (
-                    word["x0"]
-                    - group_x1
-                )
-
-                if gap < -5:
-                    continue
-
-                if gap > self.HORIZONTAL_HEADER_GAP:
-                    continue
-
-                candidate_text = " ".join(
-                    [
-                        str(
-                            item["text"]
-                        ).strip()
-                        for item in group
-                    ]
-                    + [
-                        str(
-                            word["text"]
-                        ).strip()
-                    ]
-                )
-
-                normalized = (
-                    self._normalize_header(
-                        candidate_text
-                    )
-                )
-
-                if (
-                    normalized
-                    in self.COMPOSITE_HEADERS
-                ):
-
-                    group.append(
-                        word
-                    )
-
-                    placed = True
-                    break
-
-                semantic_type, _ = (
-                    self._map_header(
-                        candidate_text
-                    )
-                )
-
-                if semantic_type:
-
-                    group.append(
-                        word
-                    )
-
-                    placed = True
-                    break
-
-            if not placed:
-
-                groups.append(
-                    [word]
-                )
-
-        # ------------------------------------------------------------
-        # Vertical reconstruction
-        # ------------------------------------------------------------
-
-        final_groups: List[
-            List[Dict]
-        ] = []
-
-        used = set()
-
-        for index, group in enumerate(
-            groups
-        ):
+        for index, first in enumerate(words):
 
             if index in used:
                 continue
 
-            current = list(
-                group
-            )
-
-            group_center = (
-                min(
-                    word["x0"]
-                    for word in current
-                )
-                + max(
-                    word["x1"]
-                    for word in current
-                )
-            ) / 2.0
-
-            group_top = min(
-                word["top"]
-                for word in current
-            )
-
             best_index = None
             best_score = 0.0
 
-            for other_index in range(
+            first_width = max(
+                first["x1"]
+                - first["x0"],
+                1.0,
+            )
+
+            first_center = (
+                first["x0"]
+                + first["x1"]
+            ) / 2
+
+            for candidate_index in range(
                 index + 1,
-                len(groups),
+                len(words),
             ):
 
-                if other_index in used:
+                if candidate_index in used:
                     continue
 
-                other = groups[
-                    other_index
+                second = words[
+                    candidate_index
                 ]
 
-                other_center = (
-                    min(
-                        word["x0"]
-                        for word in other
-                    )
-                    + max(
-                        word["x1"]
-                        for word in other
-                    )
-                ) / 2.0
-
-                other_top = min(
-                    word["top"]
-                    for word in other
-                )
-
                 vertical_gap = (
-                    other_top
-                    - group_top
+                    second["top"]
+                    - first["top"]
                 )
 
                 if vertical_gap <= 0:
@@ -933,90 +1167,187 @@ class UniversalStructureDetector:
                     vertical_gap
                     > self.MULTILINE_MAX_VERTICAL_GAP
                 ):
-                    continue
+                    break
 
-                center_distance = abs(
-                    group_center
-                    - other_center
+                second_width = max(
+                    second["x1"]
+                    - second["x0"],
+                    1.0,
                 )
 
-                if center_distance > 25:
-                    continue
+                second_center = (
+                    second["x0"]
+                    + second["x1"]
+                ) / 2
 
-                combined_words = (
-                    current
-                    + other
+                # ----------------------------------------------------
+                # Horizontal overlap.
+                # ----------------------------------------------------
+
+                overlap_left = max(
+                    first["x0"],
+                    second["x0"],
                 )
 
-                combined_text = " ".join(
-                    str(
-                        word["text"]
-                    ).strip()
-                    for word in sorted(
-                        combined_words,
-                        key=lambda word: (
-                            word["top"],
-                            word["x0"],
-                        ),
+                overlap_right = min(
+                    first["x1"],
+                    second["x1"],
+                )
+
+                overlap = max(
+                    0.0,
+                    overlap_right
+                    - overlap_left,
+                )
+
+                overlap_ratio = (
+                    overlap
+                    / min(
+                        first_width,
+                        second_width,
                     )
                 )
 
-                semantic_type, _ = (
-                    self._map_header(
+                if (
+                    overlap_ratio
+                    < self.MIN_HORIZONTAL_OVERLAP_RATIO
+                ):
+                    continue
+
+                # ----------------------------------------------------
+                # Center alignment.
+                # ----------------------------------------------------
+
+                center_distance = abs(
+                    first_center
+                    - second_center
+                )
+
+                max_width = max(
+                    first_width,
+                    second_width,
+                )
+
+                center_ratio = (
+                    center_distance
+                    / max_width
+                )
+
+                if center_ratio > 0.80:
+                    continue
+
+                # ----------------------------------------------------
+                # Score.
+                # ----------------------------------------------------
+
+                vertical_score = max(
+                    0.0,
+                    1.0
+                    - (
+                        vertical_gap
+                        / self.MULTILINE_MAX_VERTICAL_GAP
+                    ),
+                )
+
+                center_score = max(
+                    0.0,
+                    1.0
+                    - min(
+                        center_ratio,
+                        1.0,
+                    ),
+                )
+
+                score = (
+                    overlap_ratio
+                    * 0.60
+                    + center_score
+                    * 0.25
+                    + vertical_score
+                    * 0.15
+                )
+
+                if score > best_score:
+                    best_score = score
+                    best_index = candidate_index
+
+            # --------------------------------------------------------
+            # Strong geometric relationship.
+            # --------------------------------------------------------
+
+            if (
+                best_index is not None
+                and best_score >= 0.70
+            ):
+
+                second = words[
+                    best_index
+                ]
+
+                # Only combine if doing so creates a meaningful
+                # semantic header.
+                combined_text = (
+                    f"{first['text']} "
+                    f"{second['text']}"
+                ).strip()
+
+                combined_semantic, combined_confidence = (
+                    self._map_header_cached(
                         combined_text
                     )
                 )
 
-                if not semantic_type:
+                # If the combined phrase is understood by the
+                # semantic mapper, use it.
+                if combined_semantic:
+
+                    result.append(
+                        {
+                            "header": combined_text,
+                            "x0": min(
+                                first["x0"],
+                                second["x0"],
+                            ),
+                            "x1": max(
+                                first["x1"],
+                                second["x1"],
+                            ),
+                            "top": min(
+                                first["top"],
+                                second["top"],
+                            ),
+                            "bottom": max(
+                                first["bottom"],
+                                second["bottom"],
+                            ),
+                        }
+                    )
+
+                    used.add(index)
+                    used.add(best_index)
+
                     continue
 
-                score = (
-                    1.0
-                    - min(
-                        vertical_gap / 20.0,
-                        1.0,
-                    )
-                )
+            # --------------------------------------------------------
+            # No valid combination.
+            # --------------------------------------------------------
 
-                score += (
-                    1.0
-                    - min(
-                        center_distance / 25.0,
-                        1.0,
-                    )
-                )
-
-                if score > best_score:
-
-                    best_score = score
-
-                    best_index = (
-                        other_index
-                    )
-
-            if (
-                best_index is not None
-                and best_score >= 1.20
-            ):
-
-                current.extend(
-                    groups[
-                        best_index
-                    ]
-                )
-
-                used.add(
-                    best_index
-                )
-
-            final_groups.append(
-                current
+            result.append(
+                {
+                    "header": first["text"],
+                    "x0": first["x0"],
+                    "x1": first["x1"],
+                    "top": first["top"],
+                    "bottom": first["bottom"],
+                }
             )
 
-        return final_groups
+            used.add(index)
+
+        return result
 
     # ================================================================
-    # COLUMN SELECTION
+    # SELECT TRANSACTION COLUMNS
     # ================================================================
 
     def _select_transaction_columns(
@@ -1027,24 +1358,11 @@ class UniversalStructureDetector:
         if not candidates:
             return []
 
-        filtered = []
+        # ------------------------------------------------------------
+        # Deduplicate only physically identical columns.
+        # ------------------------------------------------------------
 
-        for candidate in candidates:
-
-            if self._is_artifact_header(
-                candidate.header
-            ):
-                continue
-
-            filtered.append(
-                candidate
-            )
-
-        candidates = filtered
-
-        selected: List[
-            DetectedColumn
-        ] = []
+        selected = []
 
         for candidate in sorted(
             candidates,
@@ -1056,19 +1374,9 @@ class UniversalStructureDetector:
 
             duplicate_index = None
 
-            candidate_center = (
-                candidate.x0
-                + candidate.x1
-            ) / 2.0
-
             for index, existing in enumerate(
                 selected
             ):
-
-                existing_center = (
-                    existing.x0
-                    + existing.x1
-                ) / 2.0
 
                 if (
                     existing.semantic_type
@@ -1076,10 +1384,20 @@ class UniversalStructureDetector:
                 ):
                     continue
 
+                existing_center = (
+                    existing.x0
+                    + existing.x1
+                ) / 2
+
+                candidate_center = (
+                    candidate.x0
+                    + candidate.x1
+                ) / 2
+
                 if abs(
                     existing_center
                     - candidate_center
-                ) <= 10.0:
+                ) <= 12.0:
 
                     duplicate_index = index
                     break
@@ -1090,96 +1408,24 @@ class UniversalStructureDetector:
                     candidate
                 )
 
-            else:
-
-                existing = selected[
+            elif (
+                candidate.confidence
+                > selected[
                     duplicate_index
-                ]
+                ].confidence
+            ):
 
-                if (
-                    candidate.confidence
-                    > existing.confidence
-                ):
+                selected[
+                    duplicate_index
+                ] = candidate
 
-                    selected[
-                        duplicate_index
-                    ] = candidate
-
-        final_columns = []
-
-        date_roles = {
-            "transaction_date",
-            "posting_date",
-            "value_date",
-        }
-
-        seen_roles = set()
-
-        for column in sorted(
-            selected,
-            key=lambda item: item.x0,
-        ):
-
-            role = column.semantic_type
-
-            if role in date_roles:
-
-                final_columns.append(
-                    column
-                )
-
-                continue
-
-            if role in seen_roles:
-
-                existing_index = None
-
-                for index, existing in enumerate(
-                    final_columns
-                ):
-
-                    if (
-                        existing.semantic_type
-                        == role
-                    ):
-
-                        existing_index = index
-                        break
-
-                if existing_index is not None:
-
-                    existing = final_columns[
-                        existing_index
-                    ]
-
-                    if (
-                        column.confidence
-                        > existing.confidence
-                    ):
-
-                        final_columns[
-                            existing_index
-                        ] = column
-
-                continue
-
-            seen_roles.add(
-                role
-            )
-
-            final_columns.append(
-                column
-            )
-
-        final_columns = (
-            self._resolve_amount_date_conflicts(
-                final_columns
-            )
-        )
+        # ------------------------------------------------------------
+        # Require enough transaction structure.
+        # ------------------------------------------------------------
 
         semantics = {
             column.semantic_type
-            for column in final_columns
+            for column in selected
         }
 
         has_date = bool(
@@ -1199,85 +1445,19 @@ class UniversalStructureDetector:
             )
         )
 
-        if not has_date:
-            return []
-
         if not (
-            has_description
-            or has_amount
+            has_date
+            and (
+                has_description
+                or has_amount
+            )
         ):
             return []
 
         return sorted(
-            final_columns,
+            selected,
             key=lambda column: column.x0,
         )
-
-    def _resolve_amount_date_conflicts(
-        self,
-        columns: List[DetectedColumn],
-    ) -> List[DetectedColumn]:
-
-        result = list(
-            columns
-        )
-
-        value_date_columns = [
-            column
-            for column in result
-            if column.semantic_type
-            == "value_date"
-        ]
-
-        if not value_date_columns:
-            return result
-
-        cleaned = []
-
-        for column in result:
-
-            if (
-                column.semantic_type
-                != "amount"
-            ):
-
-                cleaned.append(
-                    column
-                )
-
-                continue
-
-            amount_center = (
-                column.x0
-                + column.x1
-            ) / 2.0
-
-            conflict = False
-
-            for value_date in (
-                value_date_columns
-            ):
-
-                value_center = (
-                    value_date.x0
-                    + value_date.x1
-                ) / 2.0
-
-                if abs(
-                    amount_center
-                    - value_center
-                ) <= 20:
-
-                    conflict = True
-                    break
-
-            if not conflict:
-
-                cleaned.append(
-                    column
-                )
-
-        return cleaned
 
     # ================================================================
     # STRUCTURE SCORE
@@ -1317,7 +1497,6 @@ class UniversalStructureDetector:
         if semantics.intersection(
             {
                 "transaction_id",
-                "transaction_type",
                 "posting_date",
                 "value_date",
             }
@@ -1344,1020 +1523,3 @@ class UniversalStructureDetector:
             score,
             1.0,
         )
-
-    # ================================================================
-    # FRAGMENTED TABLE FALLBACK
-    # ================================================================
-
-    def _detect_fragmented_table(
-        self,
-        words: List[Dict],
-        page_number: int,
-    ) -> Optional[Dict]:
-
-        rows = self._group_words_by_top(
-            words
-        )
-
-        if len(rows) < 3:
-            return None
-
-        candidate_bands = []
-
-        for start in range(
-            len(rows)
-        ):
-
-            for end in range(
-                start,
-                min(
-                    len(rows),
-                    start + 4,
-                ),
-            ):
-
-                band_words = []
-
-                for index in range(
-                    start,
-                    end + 1,
-                ):
-
-                    band_words.extend(
-                        rows[index]
-                    )
-
-                mapped = (
-                    self._map_fragmented_header_words(
-                        band_words
-                    )
-                )
-
-                if not mapped:
-                    continue
-
-                columns = (
-                    self._build_fragmented_columns(
-                        mapped
-                    )
-                )
-
-                if not columns:
-                    continue
-
-                semantics = {
-                    column.semantic_type
-                    for column in columns
-                }
-
-                if not semantics.intersection(
-                    self.CORE_DATE_TYPES
-                ):
-                    continue
-
-                if not (
-                    semantics.intersection(
-                        self.AMOUNT_TYPES
-                    )
-                    or
-                    "description"
-                    in semantics
-                ):
-                    continue
-
-                candidate_bands.append(
-                    (
-                        start,
-                        end,
-                        columns,
-                    )
-                )
-
-        if not candidate_bands:
-            return None
-
-        best = None
-
-        for (
-            start,
-            end,
-            columns,
-        ) in candidate_bands:
-
-            transaction_rows = (
-                self._count_transaction_evidence(
-                    rows,
-                    end,
-                    columns,
-                )
-            )
-
-            if transaction_rows < 2:
-                continue
-
-            columns = (
-                self._select_transaction_columns(
-                    columns
-                )
-            )
-
-            if not columns:
-                continue
-
-            score = (
-                self._fragmented_structure_score(
-                    columns,
-                    transaction_rows,
-                )
-            )
-
-            candidate = (
-                score,
-                transaction_rows,
-                len(columns),
-                start,
-                end,
-                columns,
-            )
-
-            if (
-                best is None
-                or candidate[:5]
-                > best[:5]
-            ):
-
-                best = candidate
-
-        if best is None:
-            return None
-
-        (
-            score,
-            transaction_rows,
-            _,
-            start,
-            end,
-            columns,
-        ) = best
-
-        return {
-            "detected": True,
-            "page": page_number,
-            "columns": [
-                {
-                    "header": column.header,
-                    "semantic_type": column.semantic_type,
-                    "x0": round(
-                        column.x0,
-                        2,
-                    ),
-                    "x1": round(
-                        column.x1,
-                        2,
-                    ),
-                    "top": round(
-                        column.top,
-                        2,
-                    ),
-                    "confidence": round(
-                        column.confidence,
-                        4,
-                    ),
-                }
-                for column in sorted(
-                    columns,
-                    key=lambda item: item.x0,
-                )
-            ],
-            "score": round(
-                score,
-                4,
-            ),
-            "structure_score": round(
-                self._structure_score(
-                    columns
-                ),
-                4,
-            ),
-            "transaction_evidence": round(
-                min(
-                    transaction_rows / 10.0,
-                    1.0,
-                ),
-                4,
-            ),
-            "transaction_rows": transaction_rows,
-            "repeated_rows": transaction_rows,
-            "header_top": round(
-                min(
-                    rows[index][0]["top"]
-                    for index in range(
-                        start,
-                        end + 1,
-                    )
-                ),
-                2,
-            ),
-        }
-
-    # ================================================================
-    # FRAGMENTED HELPERS
-    # ================================================================
-
-    def _map_fragmented_header_words(
-        self,
-        row: List[Dict],
-    ) -> List[Dict]:
-
-        mapped = []
-
-        for word in row:
-
-            text = str(
-                word["text"]
-            ).strip()
-
-            if not text:
-                continue
-
-            if self._is_artifact_header(
-                text
-            ):
-                continue
-
-            semantic_type, confidence = (
-                self._map_header(
-                    text
-                )
-            )
-
-            if not semantic_type:
-                continue
-
-            mapped.append(
-                {
-                    **word,
-                    "semantic_type": semantic_type,
-                    "confidence": float(
-                        confidence
-                    ),
-                }
-            )
-
-        return mapped
-
-    def _build_fragmented_columns(
-        self,
-        mapped_words: List[Dict],
-    ) -> List[DetectedColumn]:
-
-        if not mapped_words:
-            return []
-
-        ordered = sorted(
-            mapped_words,
-            key=lambda item: (
-                item["x0"],
-                item["top"],
-            ),
-        )
-
-        groups: List[
-            List[Dict]
-        ] = []
-
-        for word in ordered:
-
-            best_group = None
-            best_distance = None
-
-            center = (
-                word["x0"]
-                + word["x1"]
-            ) / 2.0
-
-            for group in groups:
-
-                group_x0 = min(
-                    item["x0"]
-                    for item in group
-                )
-
-                group_x1 = max(
-                    item["x1"]
-                    for item in group
-                )
-
-                group_center = (
-                    group_x0
-                    + group_x1
-                ) / 2.0
-
-                distance = abs(
-                    center
-                    - group_center
-                )
-
-                tolerance = max(
-                    18.0,
-                    (
-                        group_x1
-                        - group_x0
-                    ) * 1.5,
-                )
-
-                if (
-                    distance
-                    <= tolerance
-                ):
-
-                    if (
-                        best_distance
-                        is None
-                        or distance
-                        < best_distance
-                    ):
-
-                        best_group = group
-                        best_distance = distance
-
-            if best_group is None:
-
-                groups.append(
-                    [word]
-                )
-
-            else:
-
-                best_group.append(
-                    word
-                )
-
-        columns = []
-
-        for group in groups:
-
-            group.sort(
-                key=lambda item: (
-                    item["top"],
-                    item["x0"],
-                )
-            )
-
-            texts = [
-                str(
-                    item["text"]
-                ).strip()
-                for item in group
-            ]
-
-            combined = " ".join(
-                texts
-            ).strip()
-
-            semantic_type, confidence = (
-                self._map_header(
-                    combined
-                )
-            )
-
-            if not semantic_type:
-
-                ranked = sorted(
-                    group,
-                    key=lambda item:
-                    item["confidence"],
-                    reverse=True,
-                )
-
-                chosen = ranked[0]
-
-                semantic_type = (
-                    chosen[
-                        "semantic_type"
-                    ]
-                )
-
-                confidence = (
-                    chosen[
-                        "confidence"
-                    ]
-                )
-
-                header = (
-                    chosen[
-                        "text"
-                    ]
-                )
-
-            else:
-
-                header = combined
-
-            columns.append(
-                DetectedColumn(
-                    header=header,
-                    semantic_type=semantic_type,
-                    x0=min(
-                        item["x0"]
-                        for item in group
-                    ),
-                    x1=max(
-                        item["x1"]
-                        for item in group
-                    ),
-                    top=min(
-                        item["top"]
-                        for item in group
-                    ),
-                    confidence=float(
-                        confidence
-                        or 0.90
-                    ),
-                )
-            )
-
-        return (
-            self._select_transaction_columns(
-                columns
-            )
-        )
-
-    # ================================================================
-    # TRANSACTION EVIDENCE
-    # ================================================================
-
-    def _count_transaction_evidence(
-        self,
-        rows: List[List[Dict]],
-        header_end: int,
-        columns: List[DetectedColumn],
-    ) -> int:
-
-        if header_end >= (
-            len(rows) - 1
-        ):
-            return 0
-
-        count = 0
-
-        for row in rows[
-            header_end + 1:
-        ]:
-
-            joined = " ".join(
-                str(
-                    item["text"]
-                )
-                for item in row
-            ).strip()
-
-            if not joined:
-                continue
-
-            lower = joined.casefold()
-
-            if any(
-                term in lower
-                for term in (
-                    "opening balance",
-                    "closing balance",
-                    "balance forward",
-                    "brought forward",
-                    "carried forward",
-                    "statement summary",
-                    "grand total",
-                    "total transactions",
-                )
-            ):
-                continue
-
-            has_date = (
-                self._row_has_date(
-                    row,
-                    [],
-                )
-            )
-
-            numeric_count = sum(
-                1
-                for item in row
-                if self._looks_numeric(
-                    item["text"]
-                )
-            )
-
-            if (
-                has_date
-                and numeric_count >= 1
-            ):
-
-                count += 1
-
-                if count >= 100:
-                    break
-
-        return count
-
-    def _row_has_date(
-        self,
-        row: List[Dict],
-        date_columns: List[DetectedColumn],
-    ) -> bool:
-
-        for item in row:
-
-            text = str(
-                item["text"]
-            ).strip()
-
-            if self._looks_like_date_token(
-                text
-            ):
-
-                if not date_columns:
-                    return True
-
-                center = (
-                    item["x0"]
-                    + item["x1"]
-                ) / 2.0
-
-                nearest = min(
-                    date_columns,
-                    key=lambda column:
-                    abs(
-                        (
-                            (
-                                column.x0
-                                + column.x1
-                            )
-                            / 2.0
-                        )
-                        - center
-                    ),
-                )
-
-                nearest_center = (
-                    nearest.x0
-                    + nearest.x1
-                ) / 2.0
-
-                if abs(
-                    nearest_center
-                    - center
-                ) <= 85:
-
-                    return True
-
-        return False
-
-    # ================================================================
-    # FRAGMENTED SCORE
-    # ================================================================
-
-    def _fragmented_structure_score(
-        self,
-        columns: List[DetectedColumn],
-        transaction_rows: int,
-    ) -> float:
-
-        base = self._structure_score(
-            columns
-        )
-
-        evidence = min(
-            transaction_rows / 10.0,
-            1.0,
-        )
-
-        return min(
-            (
-                base * 0.65
-            )
-            + (
-                evidence * 0.35
-            ),
-            1.0,
-        )
-
-    # ================================================================
-    # WORD NORMALIZATION
-    # ================================================================
-
-    def _normalize_words(
-        self,
-        words: List[Dict],
-    ) -> List[Dict]:
-
-        result = []
-
-        for word in words:
-
-            text = str(
-                word.get(
-                    "text",
-                    "",
-                )
-            ).strip()
-
-            if not text:
-                continue
-
-            try:
-
-                x0 = float(
-                    word["x0"]
-                )
-
-                x1 = float(
-                    word["x1"]
-                )
-
-                top = float(
-                    word["top"]
-                )
-
-                bottom = float(
-                    word.get(
-                        "bottom",
-                        top,
-                    )
-                )
-
-            except (
-                KeyError,
-                TypeError,
-                ValueError,
-            ):
-
-                continue
-
-            result.append(
-                {
-                    "text": text,
-                    "x0": x0,
-                    "x1": x1,
-                    "top": top,
-                    "bottom": bottom,
-                }
-            )
-
-        return result
-
-    # ================================================================
-    # INDIVIDUAL WORD MAPPING
-    # ================================================================
-
-    def _map_individual_words(
-        self,
-        words: List[Dict],
-    ) -> List[Dict]:
-
-        result = []
-
-        for word in words:
-
-            text = word[
-                "text"
-            ]
-
-            if self._is_artifact_header(
-                text
-            ):
-                continue
-
-            # "Tran" / "Txn" alone is ambiguous.
-            if (
-                self._normalize_header(
-                    text
-                )
-                in {
-                    "tran",
-                    "txn",
-                    "trans",
-                }
-            ):
-                continue
-
-            semantic_type, confidence = (
-                self._map_header(
-                    text
-                )
-            )
-
-            if not semantic_type:
-                continue
-
-            result.append(
-                {
-                    **word,
-                    "semantic_type": semantic_type,
-                    "confidence": float(
-                        confidence
-                    ),
-                }
-            )
-
-        return result
-
-    # ================================================================
-    # WORD GROUPING
-    # ================================================================
-
-    def _group_words_by_top(
-        self,
-        words: List[Dict],
-    ) -> List[List[Dict]]:
-
-        rows: List[
-            List[Dict]
-        ] = []
-
-        for word in sorted(
-            words,
-            key=lambda item: (
-                item["top"],
-                item["x0"],
-            ),
-        ):
-
-            placed = False
-
-            for row in rows:
-
-                average_top = (
-                    sum(
-                        item["top"]
-                        for item in row
-                    )
-                    / len(row)
-                )
-
-                if abs(
-                    word["top"]
-                    - average_top
-                ) <= self.WORD_ROW_TOLERANCE:
-
-                    row.append(
-                        word
-                    )
-
-                    placed = True
-                    break
-
-            if not placed:
-
-                rows.append(
-                    [word]
-                )
-
-        for row in rows:
-
-            row.sort(
-                key=lambda item:
-                item["x0"]
-            )
-
-        return rows
-
-    # ================================================================
-    # DATE DETECTION
-    # ================================================================
-
-    def _looks_like_date_token(
-        self,
-        text: str,
-    ) -> bool:
-
-        value = str(
-            text
-        ).strip().upper()
-
-        if not value:
-            return False
-
-        months = (
-            "JAN|FEB|MAR|APR|MAY|JUN|"
-            "JUL|AUG|SEP|OCT|NOV|DEC"
-        )
-
-        patterns = [
-            rf"^\d{{1,2}}[-/]({months})[-/]\d{{2,4}}$",
-            rf"^\d{{4}}[-/]({months})[-/]\\d{{1,2}}$",
-            r"^\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}$",
-            r"^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}$",
-        ]
-
-        if any(
-            re.match(
-                pattern,
-                value,
-            )
-            for pattern in patterns
-        ):
-            return True
-
-        if re.fullmatch(
-            r"\d{1,2}",
-            value,
-        ):
-
-            number = int(
-                value
-            )
-
-            return (
-                1
-                <= number
-                <= 31
-            )
-
-        if (
-            value[:3]
-            in months.split("|")
-            and len(value) <= 9
-        ):
-
-            return True
-
-        if re.fullmatch(
-            r"\d{4}",
-            value,
-        ):
-
-            year = int(
-                value
-            )
-
-            return (
-                1900
-                <= year
-                <= 2100
-            )
-
-        return False
-
-    # ================================================================
-    # NUMERIC DETECTION
-    # ================================================================
-
-    def _looks_numeric(
-        self,
-        text: str,
-    ) -> bool:
-
-        value = str(
-            text
-        ).strip()
-
-        value = value.replace(
-            ",",
-            "",
-        )
-
-        value = value.replace(
-            "₹",
-            "",
-        ).replace(
-            "$",
-            "",
-        ).replace(
-            "€",
-            "",
-        ).replace(
-            "£",
-            "",
-        )
-
-        if (
-            value.startswith("(")
-            and value.endswith(")")
-        ):
-
-            value = value[
-                1:-1
-            ]
-
-        value = value.strip()
-
-        try:
-
-            float(
-                value
-            )
-
-            return True
-
-        except (
-            TypeError,
-            ValueError,
-        ):
-
-            return False
-
-    # ================================================================
-    # HEADER HELPERS
-    # ================================================================
-
-    def _normalize_header(
-        self,
-        text: str,
-    ) -> str:
-
-        value = str(
-            text
-        ).strip().lower()
-
-        value = value.replace(
-            "&",
-            " and ",
-        )
-
-        value = re.sub(
-            r"[/_.:#\-]+",
-            " ",
-            value,
-        )
-
-        value = re.sub(
-            r"\s+",
-            " ",
-            value,
-        )
-
-        return value.strip()
-
-    def _clean_header(
-        self,
-        text: str,
-    ) -> str:
-
-        value = str(
-            text
-        ).strip()
-
-        # ------------------------------------------------------------
-        # IMPORTANT:
-        #
-        # PDF extraction can attach a CR/DR marker to a neighboring
-        # header.
-        #
-        # Examples:
-        #
-        #   Balance /CR -> Balance
-        #   Balance /DR -> Balance
-        #   Amount CR   -> Amount
-        #   Amount DR   -> Amount
-        #
-        # These are formatting artifacts, not separate columns.
-        # ------------------------------------------------------------
-
-        value = re.sub(
-            r"\s*/\s*(?:CR|DR)\s*$",
-            "",
-            value,
-            flags=re.IGNORECASE,
-        )
-
-        value = re.sub(
-            r"\s+(?:CR|DR)\s*$",
-            "",
-            value,
-            flags=re.IGNORECASE,
-        )
-
-        value = re.sub(
-            r"\s+",
-            " ",
-            value,
-        )
-
-        return value.strip()
-
-    def _is_artifact_header(
-        self,
-        text: str,
-    ) -> bool:
-
-        normalized = str(
-            text
-        ).strip().upper()
-
-        if normalized in (
-            self.ARTIFACT_HEADERS
-        ):
-            return True
-
-        if normalized.startswith(
-            "/"
-        ) and normalized[
-            1:
-        ] in {
-            "CR",
-            "DR",
-        }:
-
-            return True
-
-        return False
