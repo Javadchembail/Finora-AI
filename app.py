@@ -8,6 +8,7 @@ from pathlib import Path
 from io import BytesIO
 import re
 import time
+import traceback
 import uuid
 from collections import Counter
 from decimal import Decimal
@@ -5195,7 +5196,8 @@ if not transactions and st.session_state.page in {
 
                     # Keep the technical exception out of the customer-facing UI.
                     # It can still be inspected in the terminal during development.
-                    print(f"Finora analysis error: {exc}")
+                    print(f"Finora analysis error: {type(exc).__name__}: {exc}")
+                    traceback.print_exc()
 
     # --------------------------------------------------------
     # SECURITY NOTE
