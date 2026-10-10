@@ -30,6 +30,19 @@ BASE_CATEGORIES: Dict[str, List[str]] = {
 }
 
 RULES: List[Tuple[str, str, str, Tuple[str, ...], float]] = [
+
+    # OCR-friendly UAE statement descriptions
+    ("Life Pharmacy", "Healthcare", "Pharmacy",
+     ("life pharmacy", "life pharm", "life phy", "life phy br", "life pharm br"), 0.99),
+    ("McDonald's", "Food & Dining", "Fast Food",
+     ("mcdonald", "mcdonalds", "mcdonalds adnoc"), 0.99),
+    ("Aghadeer Cafeteria", "Food & Dining", "Cafeteria",
+     ("aghadeer cafeteria", "aghadeer"), 0.98),
+    ("Cashback Reward", "Income", "Other Income",
+     ("cashback", "cash back", "select spend", "cbk"), 0.96),
+    ("Card Payment", "Transfers", "Card Payment",
+     ("payment received thank you", "payment received", "rcv pymt"), 0.99),
+
     ("Swiggy", "Food & Dining", "Food Delivery", ("swiggy",), 0.99),
     ("Zomato", "Food & Dining", "Food Delivery", ("zomato",), 0.99),
     ("KFC", "Food & Dining", "Fast Food", ("kfc",), 0.99),

@@ -38,6 +38,8 @@ class TransactionType(str, Enum):
     TAX = "tax"
     OTHER = "other"
     UNKNOWN = "unknown"
+    CASHBACK = "cashback"
+
 
 
 class Transaction(BaseModel):

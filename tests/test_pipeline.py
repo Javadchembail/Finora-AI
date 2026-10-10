@@ -1,11 +1,15 @@
 from ingestion.pipeline import FinancialStatementPipeline
+import os
 
 
 # =========================================================
 # PDF CONFIGURATION
 # =========================================================
 
-PDF_PATH = "storage/jd new.pdf"
+PDF_PATH = os.getenv(
+    "FINORA_TEST_PDF",
+    "storage/CardStatement_2026_SEP.pdf",
+)
 
 PASSWORD = input("Enter PDF password: ").strip()
 

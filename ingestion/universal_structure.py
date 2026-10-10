@@ -681,8 +681,8 @@ class UniversalStructureDetector:
 
         months = "JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC"
         patterns = [
-            rf"^\d{{1,2}}[-/]({months})[-/]\d{{2,4}}$",
-            rf"^\d{{4}}[-/]({months})[-/]\d{{1,2}}$",
+            rf"^\d{{1,2}}[-/](?:{months})[-/]\d{{2,4}}$",
+            rf"^\d{{4}}[-/](?:{months})[-/]\d{{1,2}}$",
             r"^\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}$",
             r"^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}$",
         ]
